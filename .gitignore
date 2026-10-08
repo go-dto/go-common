@@ -1,0 +1,19 @@
+# Binaries & test output
+*.exe
+*.test
+*.out
+coverage.*
+
+# Local workspace
+go.work
+go.work.sum
+.env
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Log files from tests/examples
+log/
+*.log
