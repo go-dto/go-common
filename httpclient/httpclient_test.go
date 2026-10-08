@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -44,6 +45,10 @@ func observe(t *testing.T) *observer.ObservedLogs {
 	return logs
 }
 
+func newRawForTest(opts Options) *http.Client {
+	return newStandardClient(opts.withDefaults())
+}
+
 // statusServer replies with codes[i] on the i-th call (last code repeats).
 func statusServer(t *testing.T, codes ...int) (*httptest.Server, *atomic.Int32) {
 	t.Helper()
@@ -62,10 +67,10 @@ func statusServer(t *testing.T, codes ...int) (*httptest.Server, *atomic.Int32) 
 
 func TestRetriesThenSucceeds(t *testing.T) {
 	waits := noSleep(t)
-	logs := observe(t)
+	observe(t)
 	srv, calls := statusServer(t, 503, 502, 200)
 
-	c := New(Options{Peer: "upstream"})
+	c := newRawForTest(Options{Peer: "upstream"})
 	ctx := ctxid.WithContext(context.Background(), "trace-1")
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
 	resp, err := c.Do(req)
@@ -84,34 +89,20 @@ func TestRetriesThenSucceeds(t *testing.T) {
 		t.Errorf("waits = %v, want %v", *waits, want)
 	}
 
-	var attempts []any
-	for _, e := range logs.FilterMessageSnippet("http outbound").All() {
-		if e.Message == "http outbound retrying" {
-			continue
-		}
-		cm := e.ContextMap()
-		if cm[logger.KeyPeer] != "upstream" || cm[logger.KeyTraceID] != "trace-1" {
-			t.Errorf("missing fields: %v", cm)
-		}
-		attempts = append(attempts, cm[KeyAttempt])
-	}
-	if len(attempts) != 3 || attempts[0] != nil || attempts[1] != int64(2) || attempts[2] != int64(3) {
-		t.Errorf("attempt fields = %v", attempts)
-	}
 }
 
 func TestGivesUpAndReturnsLastResponse(t *testing.T) {
 	noSleep(t)
-	srv, calls := statusServer(t, 500)
+	srv, calls := statusServer(t, 503)
 
-	c := New(Options{MaxRetries: 1})
+	c := newRawForTest(Options{MaxRetries: 1})
 	resp, err := c.Get(srv.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != 500 || calls.Load() != 2 || string(body) != "ok" {
+	if resp.StatusCode != 503 || calls.Load() != 2 || string(body) != "ok" {
 		t.Fatalf("status=%d calls=%d body=%q", resp.StatusCode, calls.Load(), body)
 	}
 }
@@ -119,7 +110,7 @@ func TestGivesUpAndReturnsLastResponse(t *testing.T) {
 func TestNoRetryOnClientError(t *testing.T) {
 	noSleep(t)
 	srv, calls := statusServer(t, 400)
-	resp, err := New(Options{}).Get(srv.URL)
+	resp, err := newRawForTest(Options{}).Get(srv.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +123,7 @@ func TestNoRetryOnClientError(t *testing.T) {
 func TestDisableRetry(t *testing.T) {
 	noSleep(t)
 	srv, calls := statusServer(t, 503)
-	resp, err := New(Options{DisableRetry: true}).Get(srv.URL)
+	resp, err := newRawForTest(Options{DisableRetry: true}).Get(srv.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +155,7 @@ func TestPostRetryRules(t *testing.T) {
 			if tt.idemKey != "" {
 				req.Header.Set(tt.idemKey, "k1")
 			}
-			resp, err := New(tt.opts).Do(req)
+			resp, err := newRawForTest(tt.opts).Do(req)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -192,7 +183,7 @@ func TestRetryAfter(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	resp, err := New(Options{MaxBackoff: 2 * time.Second}).Get(srv.URL)
+	resp, err := newRawForTest(Options{MaxBackoff: 2 * time.Second}).Get(srv.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +195,7 @@ func TestRetryAfter(t *testing.T) {
 	// Retry-After longer than MaxBackoff: give up and return the 429.
 	calls.Store(0)
 	*waits = nil
-	resp, err = New(Options{MaxBackoff: 500 * time.Millisecond}).Get(srv.URL)
+	resp, err = newRawForTest(Options{MaxBackoff: 500 * time.Millisecond}).Get(srv.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,11 +211,11 @@ func TestTransportErrorRetried(t *testing.T) {
 	var calls atomic.Int32
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if calls.Add(1) < 3 {
-			return nil, errors.New("connection reset by peer")
+			return nil, syscall.ECONNRESET
 		}
 		return &http.Response{StatusCode: 200, Body: http.NoBody, Request: r}, nil
 	})
-	resp, err := New(Options{Transport: rt}).Get("http://example.invalid/")
+	resp, err := newRawForTest(Options{Transport: rt}).Get("http://example.invalid/")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -246,7 +237,7 @@ func TestPerAttemptTimeoutRetries(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(Options{PerAttemptTimeout: 50 * time.Millisecond})
+	c := newRawForTest(Options{PerAttemptTimeout: 50 * time.Millisecond})
 	resp, err := c.Get(srv.URL)
 	if err != nil {
 		t.Fatal(err)
@@ -266,7 +257,7 @@ func TestContextCanceledStopsRetrying(t *testing.T) {
 
 	srv, calls := statusServer(t, 503)
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
-	_, err := New(Options{}).Do(req)
+	_, err := newRawForTest(Options{}).Do(req)
 	if !errors.Is(err, context.Canceled) || calls.Load() != 1 {
 		t.Fatalf("err=%v calls=%d", err, calls.Load())
 	}
@@ -276,7 +267,7 @@ func TestTotalTimeoutBudget(t *testing.T) {
 	waits := noSleep(t)
 	srv, calls := statusServer(t, 503)
 	// Backoff (1s) exceeds the remaining budget (200ms): stop after one attempt.
-	c := New(Options{Timeout: 200 * time.Millisecond, InitialBackoff: time.Second, MaxBackoff: time.Second})
+	c := newRawForTest(Options{Timeout: 200 * time.Millisecond, InitialBackoff: time.Second, MaxBackoff: time.Second})
 	resp, err := c.Get(srv.URL)
 	if err != nil {
 		t.Fatal(err)
@@ -299,11 +290,11 @@ func TestBackoffCapped(t *testing.T) {
 }
 
 func TestDefaultsApplied(t *testing.T) {
-	c := New(Options{})
+	c := newRawForTest(Options{})
 	if c.Timeout != DefaultTimeout {
 		t.Errorf("Timeout = %v", c.Timeout)
 	}
-	if c := New(Options{Timeout: -1}); c.Timeout != 0 {
+	if c := newRawForTest(Options{Timeout: -1}); c.Timeout != 0 {
 		t.Errorf("negative Timeout should disable, got %v", c.Timeout)
 	}
 	tr := newBaseTransport(Options{}.withDefaults())
@@ -331,7 +322,7 @@ func TestResponseHeaderTimeoutRetries(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	resp, err := New(Options{ResponseHeaderTimeout: 50 * time.Millisecond}).Get(srv.URL)
+	resp, err := newRawForTest(Options{ResponseHeaderTimeout: 50 * time.Millisecond}).Get(srv.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -346,7 +337,7 @@ func TestOnRetry(t *testing.T) {
 	noSleep(t)
 	srv, _ := statusServer(t, 503, 502, 200)
 	var events []RetryEvent
-	resp, err := New(Options{Peer: "upstream", OnRetry: func(e RetryEvent) { events = append(events, e) }}).Get(srv.URL)
+	resp, err := newRawForTest(Options{Peer: "upstream", OnRetry: func(e RetryEvent) { events = append(events, e) }}).Get(srv.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -362,7 +353,7 @@ func TestOnRetry(t *testing.T) {
 	for i, w := range want {
 		e := events[i]
 		if e.Attempt != w.attempt || e.StatusCode != w.status || e.Wait != w.wait || e.Err != nil ||
-			e.Peer != "upstream" || e.Request == nil {
+			e.Peer != "upstream" {
 			t.Errorf("event %d = %+v, want attempt=%d status=%d wait=%v", i, e, w.attempt, w.status, w.wait)
 		}
 	}
@@ -371,7 +362,7 @@ func TestOnRetry(t *testing.T) {
 func TestOnRetryTransportError(t *testing.T) {
 	noSleep(t)
 	observe(t)
-	boom := errors.New("connection reset by peer")
+	boom := syscall.ECONNRESET
 	var calls atomic.Int32
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if calls.Add(1) == 1 {
@@ -380,7 +371,7 @@ func TestOnRetryTransportError(t *testing.T) {
 		return &http.Response{StatusCode: 200, Body: http.NoBody, Request: r}, nil
 	})
 	var events []RetryEvent
-	resp, err := New(Options{Transport: rt, OnRetry: func(e RetryEvent) { events = append(events, e) }}).Get("http://example.invalid/")
+	resp, err := newRawForTest(Options{Transport: rt, OnRetry: func(e RetryEvent) { events = append(events, e) }}).Get("http://example.invalid/")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -407,7 +398,7 @@ func TestTLSClientConfig(t *testing.T) {
 	pool := x509.NewCertPool()
 	pool.AddCert(srv.Certificate())
 
-	resp, err := New(Options{TLSClientConfig: &tls.Config{RootCAs: pool}}).Get(srv.URL)
+	resp, err := newRawForTest(Options{TLSClientConfig: &tls.Config{RootCAs: pool}}).Get(srv.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -422,7 +413,7 @@ func TestCertificateErrorNotRetried(t *testing.T) {
 	noSleep(t)
 	srv := tlsServer(t)
 	retried := false
-	_, err := New(Options{OnRetry: func(RetryEvent) { retried = true }}).Get(srv.URL) // self-signed, not trusted
+	_, err := newRawForTest(Options{OnRetry: func(RetryEvent) { retried = true }}).Get(srv.URL) // self-signed, not trusted
 	if err == nil {
 		t.Fatal("expected certificate error")
 	}
@@ -438,7 +429,7 @@ func TestProxy(t *testing.T) {
 	defer proxy.Close()
 	proxyURL, _ := url.Parse(proxy.URL)
 
-	resp, err := New(Options{Proxy: http.ProxyURL(proxyURL)}).Get("http://upstream.invalid/path")
+	resp, err := newRawForTest(Options{Proxy: http.ProxyURL(proxyURL)}).Get("http://upstream.invalid/path")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -461,7 +452,7 @@ func TestRetryAfterHTTPDate(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	resp, err := New(Options{MaxBackoff: 5 * time.Second}).Get(srv.URL)
+	resp, err := newRawForTest(Options{MaxBackoff: 5 * time.Second}).Get(srv.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -478,14 +469,14 @@ func TestRetryAfterIgnoredOnOtherStatuses(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if calls.Add(1) == 1 {
 			w.Header().Set("Retry-After", "1")
-			w.WriteHeader(http.StatusInternalServerError)
+			w.WriteHeader(http.StatusBadGateway)
 			return
 		}
 		w.WriteHeader(200)
 	}))
 	defer srv.Close()
 
-	resp, err := New(Options{}).Get(srv.URL)
+	resp, err := newRawForTest(Options{}).Get(srv.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -505,7 +496,7 @@ func TestRetryAfterOverflow(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	resp, err := New(Options{}).Get(srv.URL)
+	resp, err := newRawForTest(Options{}).Get(srv.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -519,38 +510,13 @@ func TestRetryAfterOverflow(t *testing.T) {
 func TestEmptyRetryStatuses(t *testing.T) {
 	noSleep(t)
 	srv, calls := statusServer(t, 503)
-	resp, err := New(Options{RetryStatuses: []int{}}).Get(srv.URL)
+	resp, err := newRawForTest(Options{RetryStatuses: []int{}}).Get(srv.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
 	if calls.Load() != 1 {
 		t.Fatalf("calls=%d, want 1", calls.Load())
-	}
-}
-
-func TestCustomShouldRetry(t *testing.T) {
-	noSleep(t)
-	only404 := func(resp *http.Response, err error) bool { return resp != nil && resp.StatusCode == 404 }
-
-	srv, calls := statusServer(t, 404)
-	resp, err := New(Options{ShouldRetry: only404}).Get(srv.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if calls.Load() != 3 {
-		t.Errorf("404: calls=%d, want 3", calls.Load())
-	}
-
-	srv, calls = statusServer(t, 503)
-	resp, err = New(Options{ShouldRetry: only404}).Get(srv.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if calls.Load() != 1 {
-		t.Errorf("503: calls=%d, want 1 (ShouldRetry replaces RetryStatuses)", calls.Load())
 	}
 }
 
@@ -561,7 +527,7 @@ func TestGetBodyError(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodPut, srv.URL, strings.NewReader("x"))
 	req.GetBody = func() (io.ReadCloser, error) { return nil, boom }
 
-	_, err := New(Options{}).Do(req)
+	_, err := newRawForTest(Options{}).Do(req)
 	if !errors.Is(err, boom) || calls.Load() != 1 {
 		t.Fatalf("err=%v calls=%d", err, calls.Load())
 	}
@@ -570,7 +536,7 @@ func TestGetBodyError(t *testing.T) {
 func TestDisableLogging(t *testing.T) {
 	logs := observe(t)
 	srv, _ := statusServer(t, 200)
-	resp, err := New(Options{DisableLogging: true}).Get(srv.URL)
+	resp, err := newRawForTest(Options{DisableLogging: true}).Get(srv.URL)
 	if err != nil {
 		t.Fatal(err)
 	}

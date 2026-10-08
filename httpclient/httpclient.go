@@ -1,204 +1,212 @@
 package httpclient
 
 import (
-	"crypto/tls"
+	"context"
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
+	"sync/atomic"
 	"time"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 
 	"github.com/go-dto/go-common/logger"
 )
 
-// Defaults applied by New when the matching Options field is zero.
-const (
-	DefaultTimeout             = 30 * time.Second
-	DefaultMaxRetries          = 2
-	DefaultInitialBackoff      = 100 * time.Millisecond
-	DefaultMaxBackoff          = 2 * time.Second
-	DefaultDialTimeout         = 5 * time.Second
-	DefaultTLSHandshakeTimeout = 5 * time.Second
-	// DefaultResponseHeaderTimeout keeps a hung peer from eating the whole
-	// Timeout in one attempt: the attempt fails and can be retried.
-	DefaultResponseHeaderTimeout = 10 * time.Second
-	DefaultMaxIdleConnsPerHost   = 10
-)
-
-// DefaultRetryStatuses are the response codes retried when Options.RetryStatuses is nil.
-var DefaultRetryStatuses = []int{
-	http.StatusTooManyRequests,     // 429
-	http.StatusInternalServerError, // 500
-	http.StatusBadGateway,          // 502
-	http.StatusServiceUnavailable,  // 503
-	http.StatusGatewayTimeout,      // 504
+// Client is the high-level HTTP client exposed to applications. It hides
+// net/http request construction, response-body lifecycle, retries and logging.
+// A Client is safe for concurrent use and should be created once per peer.
+type Client struct {
+	cfg     Config
+	baseURL *url.URL
+	client  *http.Client
 }
 
-// Options configures New. The zero value is usable: every zero field falls
-// back to the matching Default* value.
-type Options struct {
-	// Peer is a logical name for the third party (e.g. "client_webhook");
-	// logged as "peer" on every outbound line.
-	Peer string
-
-	// Timeout is the total budget for one Do call, across all attempts and
-	// backoff waits, including reading the response body. Default 30s;
-	// negative disables it (rely on the request context instead).
-	Timeout time.Duration
-
-	// PerAttemptTimeout bounds a single attempt (connect → body closed), so a
-	// hung attempt can be retried within Timeout. 0 = no per-attempt limit.
-	PerAttemptTimeout time.Duration
-
-	// MaxRetries is the number of retries after the first attempt (default 2,
-	// i.e. up to 3 attempts). Set DisableRetry to turn retries off.
-	MaxRetries   int
-	DisableRetry bool
-
-	// InitialBackoff and MaxBackoff shape the exponential backoff (with
-	// jitter) between attempts. Defaults 100ms and 2s. A Retry-After header on
-	// 429/503 is honoured when it is not longer than MaxBackoff; a longer one
-	// ends retrying and returns the response to the caller.
-	InitialBackoff time.Duration
-	MaxBackoff     time.Duration
-
-	// RetryStatuses lists response codes to retry. nil = DefaultRetryStatuses;
-	// an empty non-nil slice retries transport errors only.
-	RetryStatuses []int
-
-	// RetryNonIdempotent allows retrying POST/PATCH (and other non-idempotent
-	// methods). By default those are retried only when the request carries an
-	// Idempotency-Key header.
-	RetryNonIdempotent bool
-
-	// ShouldRetry, if set, replaces the status/error check (RetryStatuses and
-	// the default transport-error rules). Method, body and budget rules still
-	// apply. resp is nil when err is non-nil.
-	ShouldRetry func(resp *http.Response, err error) bool
-
-	// OnRetry, if set, is called synchronously each time an attempt is about
-	// to be retried, after the wait has been decided and before sleeping.
-	// Use it for metrics; it must be fast and must not modify the request.
-	OnRetry func(RetryEvent)
-
-	// Transport is the base RoundTripper. nil = a clone of
-	// http.DefaultTransport tuned with the fields below.
-	Transport http.RoundTripper
-
-	// Base transport tuning; ignored when Transport is set.
-	DialTimeout           time.Duration // default 5s
-	TLSHandshakeTimeout   time.Duration // default 5s
-	ResponseHeaderTimeout time.Duration // default 10s; negative disables
-	MaxIdleConnsPerHost   int           // default 10 (net/http default is 2)
-	MaxConnsPerHost       int           // 0 = unlimited
-
-	// TLSClientConfig sets custom root CAs, client certificates (mTLS), etc.
-	// It is cloned; nil = Go defaults. Ignored when Transport is set.
-	TLSClientConfig *tls.Config
-
-	// Proxy selects the proxy per request. nil = http.ProxyFromEnvironment
-	// (HTTP_PROXY / HTTPS_PROXY / NO_PROXY). Ignored when Transport is set.
-	Proxy func(*http.Request) (*url.URL, error)
-
-	// Logging, passed to logger.NewHTTPTransport.
-	DisableLogging     bool
-	DisablePropagation bool
-	LogHeaders         bool
-	Redactor           *logger.Redactor
+// New validates cfg and constructs a reusable high-level client.
+func New(cfg Config) (*Client, error) {
+	normalized, baseURL, err := cfg.normalized()
+	if err != nil {
+		return nil, err
+	}
+	return &Client{
+		cfg:     normalized,
+		baseURL: baseURL,
+		client:  newStandardClient(normalized),
+	}, nil
 }
 
-// New returns an *http.Client with timeouts, retry/backoff and logging:
-//
-//	http.Client{Timeout}
-//	  └─ retry (backoff, Retry-After, per-attempt timeout)
-//	       └─ logger.NewHTTPTransport (X-Request-ID, one log line per attempt)
-//	            └─ base transport (pooled, dial/TLS timeouts)
-//
-// Every attempt is logged separately; retries carry an "attempt" field (2, 3, …).
-// Build requests with http.NewRequestWithContext so trace_id reaches the logs
-// and the request can be cancelled. Bodies are replayed with Request.GetBody,
-// which http.NewRequest sets for *bytes.Buffer, *bytes.Reader and
-// *strings.Reader; a request with any other body is sent once, never retried.
-//
-// The returned client is safe for concurrent use; create one per peer and reuse it.
-func New(opts Options) *http.Client {
-	opts = opts.withDefaults()
-
-	base := opts.Transport
-	if base == nil {
-		base = newBaseTransport(opts)
-	}
-	rt := base
-	if !opts.DisableLogging {
-		rt = logger.NewHTTPTransport(rt, logger.HTTPClientOptions{
-			Peer:               opts.Peer,
-			DisablePropagation: opts.DisablePropagation,
-			LogHeaders:         opts.LogHeaders,
-			Redactor:           opts.Redactor,
-		})
-	}
-	if !opts.DisableRetry || opts.PerAttemptTimeout > 0 {
-		rt = newRetryTransport(rt, opts)
-	}
-
-	c := &http.Client{Transport: rt}
-	if opts.Timeout > 0 {
-		c.Timeout = opts.Timeout
+// MustNew is New for application startup. It panics when cfg is invalid.
+func MustNew(cfg Config) *Client {
+	c, err := New(cfg)
+	if err != nil {
+		panic(err)
 	}
 	return c
 }
 
-func (o Options) withDefaults() Options {
-	if o.Timeout == 0 {
-		o.Timeout = DefaultTimeout
+// CloseIdleConnections closes keep-alive connections currently sitting idle.
+// It is useful during graceful shutdown; the Client remains reusable afterwards.
+func (c *Client) CloseIdleConnections() {
+	if c != nil && c.client != nil {
+		c.client.CloseIdleConnections()
 	}
-	if o.MaxRetries <= 0 {
-		o.MaxRetries = DefaultMaxRetries
-	}
-	if o.DisableRetry {
-		o.MaxRetries = 0
-	}
-	if o.InitialBackoff <= 0 {
-		o.InitialBackoff = DefaultInitialBackoff
-	}
-	if o.MaxBackoff <= 0 {
-		o.MaxBackoff = DefaultMaxBackoff
-	}
-	if o.MaxBackoff < o.InitialBackoff {
-		o.MaxBackoff = o.InitialBackoff
-	}
-	if o.RetryStatuses == nil {
-		o.RetryStatuses = DefaultRetryStatuses
-	}
-	if o.DialTimeout <= 0 {
-		o.DialTimeout = DefaultDialTimeout
-	}
-	if o.TLSHandshakeTimeout <= 0 {
-		o.TLSHandshakeTimeout = DefaultTLSHandshakeTimeout
-	}
-	if o.ResponseHeaderTimeout == 0 {
-		o.ResponseHeaderTimeout = DefaultResponseHeaderTimeout
-	}
-	if o.MaxIdleConnsPerHost <= 0 {
-		o.MaxIdleConnsPerHost = DefaultMaxIdleConnsPerHost
-	}
-	return o
 }
 
-func newBaseTransport(o Options) *http.Transport {
+func newStandardClient(cfg Config) *http.Client {
+	base := cfg.Transport
+	if base == nil {
+		base = newBaseTransport(cfg)
+	}
+
+	var rt http.RoundTripper = base
+	if !cfg.DisablePropagation {
+		rt = &propagationTransport{next: rt}
+	}
+	if !cfg.DisableRetry || cfg.PerAttemptTimeout > 0 {
+		rt = newRetryTransport(rt, cfg)
+	}
+
+	client := &http.Client{Transport: rt, CheckRedirect: redirectPolicy(cfg)}
+	if cfg.Timeout > 0 {
+		client.Timeout = cfg.Timeout
+	}
+	return client
+}
+
+func redirectPolicy(cfg Config) func(*http.Request, []*http.Request) error {
+	if !cfg.FollowRedirects {
+		return func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	}
+	return func(req *http.Request, via []*http.Request) error {
+		if len(via) >= cfg.MaxRedirects {
+			return &Error{Kind: KindTransport, Peer: cfg.Peer, message: "redirect limit exceeded"}
+		}
+		if len(via) > 0 {
+			origin := via[0].URL
+			if req.URL.Scheme != origin.Scheme || !strings.EqualFold(req.URL.Host, origin.Host) {
+				return &Error{Kind: KindTransport, Peer: cfg.Peer, message: "cross-host redirect blocked"}
+			}
+		}
+		return nil
+	}
+}
+
+func newBaseTransport(cfg Config) *http.Transport {
 	t := http.DefaultTransport.(*http.Transport).Clone()
-	t.DialContext = (&net.Dialer{Timeout: o.DialTimeout, KeepAlive: 30 * time.Second}).DialContext
-	t.TLSHandshakeTimeout = o.TLSHandshakeTimeout
-	t.ResponseHeaderTimeout = max(o.ResponseHeaderTimeout, 0)
-	t.MaxIdleConnsPerHost = o.MaxIdleConnsPerHost
-	t.MaxConnsPerHost = o.MaxConnsPerHost
-	if t.MaxIdleConns < o.MaxIdleConnsPerHost {
-		t.MaxIdleConns = o.MaxIdleConnsPerHost
+	t.DialContext = (&net.Dialer{Timeout: cfg.DialTimeout, KeepAlive: 30 * time.Second}).DialContext
+	t.TLSHandshakeTimeout = cfg.TLSHandshakeTimeout
+	t.ResponseHeaderTimeout = max(cfg.ResponseHeaderTimeout, 0)
+	t.MaxIdleConnsPerHost = cfg.MaxIdleConnsPerHost
+	t.MaxConnsPerHost = cfg.MaxConnsPerHost
+	if t.MaxIdleConns < cfg.MaxIdleConnsPerHost {
+		t.MaxIdleConns = cfg.MaxIdleConnsPerHost
 	}
-	if o.TLSClientConfig != nil {
-		t.TLSClientConfig = o.TLSClientConfig.Clone()
+	if cfg.TLSClientConfig != nil {
+		t.TLSClientConfig = cfg.TLSClientConfig.Clone()
 	}
-	if o.Proxy != nil {
-		t.Proxy = o.Proxy
+	if cfg.Proxy != nil {
+		t.Proxy = cfg.Proxy
 	}
 	return t
+}
+
+type propagationTransport struct {
+	next http.RoundTripper
+}
+
+func (t *propagationTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	clone := req.Clone(req.Context())
+	clone.Header = req.Header.Clone()
+	logger.InjectHeaders(clone.Context(), clone.Header)
+	return t.next.RoundTrip(clone)
+}
+
+type requestStateKey struct{}
+
+type requestState struct {
+	attempts  atomic.Int32
+	method    Method
+	operation string
+}
+
+func stateFromContext(ctx context.Context) *requestState {
+	if ctx == nil {
+		return nil
+	}
+	state, _ := ctx.Value(requestStateKey{}).(*requestState)
+	return state
+}
+
+func (c *Client) logResult(ctx context.Context, event resultEvent) {
+	if c.cfg.OnResult != nil {
+		c.cfg.OnResult(ctx, ResultEvent{
+			Peer: c.cfg.Peer, Method: event.method, Operation: event.operation,
+			StatusCode: event.statusCode, Attempts: event.attempts,
+			Duration: event.duration, Outcome: event.outcome, ErrorKind: KindOf(event.err),
+		})
+	}
+	if c.cfg.DisableLogging {
+		return
+	}
+
+	fields := []zap.Field{
+		zap.String(logger.KeyPeer, c.cfg.Peer),
+		zap.String("method", string(event.method)),
+		zap.String("operation", event.operation),
+		zap.Int("attempt_count", event.attempts),
+		zap.Int("retry_count", max(event.attempts-1, 0)),
+		zap.Float64(logger.KeyDurationMs, float64(event.duration)/float64(time.Millisecond)),
+		zap.String("outcome", event.outcome),
+	}
+	if event.statusCode > 0 {
+		fields = append(fields, zap.Int("status_code", event.statusCode))
+	}
+	if event.err != nil {
+		fields = append(fields, zap.String("error_kind", string(KindOf(event.err))))
+	}
+
+	level := zapcore.InfoLevel
+	message := "http outbound completed"
+	switch {
+	case event.err != nil && KindOf(event.err) != KindHTTPStatus:
+		level, message = zapcore.ErrorLevel, "http outbound failed"
+		if !logger.MarkErrorLogged(ctx, event.err) {
+			level = zapcore.DebugLevel
+		}
+	case event.err != nil:
+		level, message = zapcore.WarnLevel, "http outbound error status"
+	case event.attempts > 1:
+		level, message = zapcore.WarnLevel, "http outbound recovered"
+	}
+
+	logCtx := logger.WithFields(ctx, zap.String(logger.KeyLayer, logger.LayerClient))
+	log := logger.FromContext(logCtx).WithOptions(zap.WithCaller(false))
+	if checked := log.Check(level, message); checked != nil {
+		checked.Write(fields...)
+	}
+}
+
+// ResultEvent is the sanitized final result of one logical request, including
+// all retries and response-body reading. It contains no URL, header or body.
+type ResultEvent struct {
+	Peer       string
+	Method     Method
+	Operation  string
+	StatusCode int
+	Attempts   int
+	Duration   time.Duration
+	Outcome    string
+	ErrorKind  ErrorKind
+}
+
+type resultEvent struct {
+	method     Method
+	operation  string
+	statusCode int
+	attempts   int
+	duration   time.Duration
+	outcome    string
+	err        error
 }

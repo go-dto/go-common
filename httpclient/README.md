@@ -1,107 +1,291 @@
 # httpclient
 
-HTTP client standar untuk memanggil pihak ketiga / service lain: timeout yang wajar, connection pool yang di-tune, retry dengan exponential backoff, dan logging per attempt lewat [`logger`](../logger/README.md) (propagasi `X-Request-ID`, redaksi URL/header).
+HTTP client high-level untuk service Go. Developer cukup memakai `Get`, `Post`,
+`Put`, `Patch`, atau `Delete`; package menangani URL, header, JSON, timeout,
+retry, penutupan response body, error classification, trace propagation, dan
+structured logging.
 
 ```go
 import "github.com/go-dto/go-common/httpclient"
 ```
 
-## Pemakaian
+Application code tidak perlu mengimpor `net/http`.
 
-Buat **satu client per peer**, sekali saat startup, lalu pakai ulang (aman untuk concurrent use):
+## Quick start
+
+Buat satu client per upstream saat startup, lalu gunakan ulang:
 
 ```go
-webhookClient := httpclient.New(httpclient.Options{
-	Peer:    "client_webhook",
-	Timeout: 10 * time.Second,
+paymentClient, err := httpclient.New(httpclient.Config{
+    Peer:    "payment-api",
+    BaseURL: cfg.PaymentURL,
+    Timeout: 10 * time.Second,
+    DefaultHeaders: httpclient.HeaderMap{
+        "Accept": "application/json",
+    },
+    Auth: httpclient.BearerToken(cfg.PaymentToken),
 })
-
-req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 if err != nil {
-	return err
+    return err
 }
-req.Header.Set("Content-Type", "application/json")
-req.Header.Set("Idempotency-Key", requestID) // POST jadi boleh di-retry
-resp, err := webhookClient.Do(req)
+```
+
+Untuk konfigurasi startup yang sudah pasti valid, tersedia
+`httpclient.MustNew`.
+
+### GET
+
+```go
+response, err := paymentClient.Get(ctx, "/v1/payments/{id}",
+    httpclient.Path("id", paymentID),
+    httpclient.Query("include", "history"),
+    httpclient.Header("X-Tenant-ID", tenantID),
+    httpclient.Operation("payment.get"),
+)
 if err != nil {
-	return err
+    return err
 }
-defer resp.Body.Close()
+
+var payment Payment
+if err := response.JSON(&payment); err != nil {
+    return err
+}
 ```
 
-Selalu pakai `http.NewRequestWithContext` agar `trace_id` & field context masuk ke log dan request bisa dibatalkan.
+`Path` melakukan URL escaping. Gunakan placeholder; jangan menggabungkan ID ke
+path secara manual.
 
-## Susunan
+### POST JSON
 
+```go
+response, err := paymentClient.Post(ctx, "/v1/payments",
+    httpclient.JSON(CreatePaymentRequest{
+        Amount:   100_000,
+        Currency: "IDR",
+    }),
+    httpclient.IdempotencyKey(requestID),
+    httpclient.Operation("payment.create"),
+)
+if err != nil {
+    return err
+}
+
+var result Payment
+if err := response.JSON(&result); err != nil {
+    return err
+}
 ```
-http.Client{Timeout}                      ← total budget semua attempt + backoff + baca body
-  └─ retry (backoff, Retry-After, PerAttemptTimeout)
-       └─ logger.NewHTTPTransport         ← X-Request-ID, 1 log line per attempt
-            └─ *http.Transport            ← pool & dial/TLS timeout
+
+`IdempotencyKey` membuat POST/PATCH eligible untuk retry. Tanpanya,
+non-idempotent request dikirim satu kali.
+
+## Method dan request option
+
+Method utama:
+
+- `Get`
+- `Head`
+- `Post`
+- `Put`
+- `Patch`
+- `Delete`
+- `Request` dengan `MethodGet`, `MethodPost`, dan konstanta lainnya untuk kasus
+  khusus
+
+Request option:
+
+| Option | Kegunaan |
+|---|---|
+| `Path(name, value)` | Mengisi `{name}` dengan path escaping. |
+| `Query(name, value)` | Query parameter tunggal. |
+| `QueryValues(name, values...)` | Query parameter berulang. |
+| `Queries(map)` | Beberapa query parameter. |
+| `Header(name, value)` | Header per request. |
+| `Headers(map)` | Beberapa header per request. |
+| `JSON(value)` | Encode JSON + `Content-Type: application/json`. |
+| `Form(map)` | Encode form URL-encoded. |
+| `Text(value)` | Plain-text body. |
+| `Bytes(contentType, value)` | Byte body dengan content type eksplisit. |
+| `IdempotencyKey(value)` | Header idempotency untuk write retry. |
+| `AcceptStatus(codes...)` | Mengganti default success `200-299`. |
+| `Operation(name)` | Nama aman dan low-cardinality untuk log/metrics. |
+| `RequestTimeout(duration)` | Budget lebih ketat untuk satu request. |
+
+Header transport seperti `Host`, `Content-Length`, `Connection` dan
+`Transfer-Encoding` ditolak. Authentication dari `Config.Auth` diterapkan
+setelah request options agar tidak dapat tertimpa tanpa sengaja.
+
+## Authentication
+
+```go
+httpclient.BearerToken(token)
+httpclient.BearerTokenProvider(func(ctx context.Context) (string, error) {
+    return tokenStore.Token(ctx)
+})
+httpclient.BasicAuth(username, password)
+httpclient.APIKey("X-API-Key", apiKey)
 ```
 
-## Options & default
+Nilai authentication tidak pernah dimasukkan ke log atau error message.
+
+## Response
+
+`Response` sudah dibaca dengan batas ukuran dan body sudah ditutup sebelum
+method selesai. Caller tidak perlu memanggil `Close`.
+
+```go
+response.StatusCode
+response.Attempts
+response.Duration
+response.IsSuccess()
+response.Header("ETag")
+response.HeaderValues("Set-Cookie")
+response.Headers()
+response.JSON(&destination)
+response.Text()
+response.Bytes()
+```
+
+Default maksimum body adalah 4 MiB dan dapat diubah melalui
+`MaxResponseBodyBytes`. `Bytes()` selalu mengembalikan salinan.
+
+## Error
+
+Status di luar `200-299` menghasilkan `*httpclient.Error` dan tetap
+mengembalikan `Response`, sehingga caller bisa membaca body error bila kontrak
+upstream membutuhkannya.
+
+```go
+response, err := paymentClient.Get(ctx, "/v1/payments/{id}",
+    httpclient.Path("id", paymentID),
+)
+
+switch {
+case httpclient.IsTimeout(err):
+    // timeout
+case httpclient.IsStatus(err, 404):
+    // not found
+case httpclient.IsRetryExhausted(err):
+    // seluruh attempt sudah digunakan
+case err != nil:
+    // error lain
+}
+```
+
+`KindOf(err)` menghasilkan klasifikasi stabil:
+
+- `invalid_config`
+- `invalid_request`
+- `auth`
+- `canceled`
+- `timeout`
+- `tls`
+- `transport`
+- `http_status`
+- `response_too_large`
+- `decode`
+
+Error message tidak memuat raw URL, path parameter, header, token, query, atau
+response body.
+
+## Retry
+
+Default maksimal tiga attempt: request pertama + dua retry. Default status yang
+di-retry adalah `429`, `502`, `503`, dan `504`. `500` tidak di-retry secara
+default, tetapi dapat ditambahkan melalui `RetryStatuses`.
+
+Request hanya di-retry bila:
+
+1. Method idempotent, memiliki `Idempotency-Key`, atau
+   `RetryNonIdempotent` diaktifkan.
+2. Body dapat diulang.
+3. Status termasuk `RetryStatuses`, atau terjadi transient transport error
+   seperti timeout, EOF, connection reset/refused, atau temporary DNS failure.
+4. Context dan total timeout masih memiliki budget.
+5. `Retry-After` pada `429`/`503` tidak melebihi `MaxBackoff`.
+
+Certificate error, canceled context, permanent DNS error, malformed request,
+dan konfigurasi yang deterministik tidak di-retry.
+
+`PerAttemptTimeout` tetap aktif saat body dibaca. Bila body timeout setelah
+header diterima, request tidak otomatis diulang karena sebagian response sudah
+diterima.
+
+## Redirect
+
+Redirect tidak diikuti secara default. Ini mencegah API key atau custom auth
+header terbawa ke host yang tidak dipercaya.
+
+`FollowRedirects: true` hanya mengizinkan redirect dengan scheme dan host yang
+sama. `MaxRedirects` default 10 saat fitur ini diaktifkan. Cross-host redirect
+selalu ditolak.
+
+## Logging dan observability
+
+Setiap logical request menghasilkan tepat satu final log, bukan satu warn/error
+untuk setiap attempt:
+
+```json
+{
+  "level": "warn",
+  "msg": "http outbound recovered",
+  "trace_id": "...",
+  "layer": "client",
+  "peer": "payment-api",
+  "method": "POST",
+  "operation": "payment.create",
+  "status_code": 201,
+  "attempt_count": 2,
+  "retry_count": 1,
+  "duration_ms": 312.7,
+  "outcome": "success_after_retry"
+}
+```
+
+Log tidak berisi URL, path parameter, query value, header, atau body. Detail
+retry hanya ditulis pada level debug. Trace ID dari context otomatis diteruskan
+sebagai `X-Request-ID`.
+
+Hook untuk metrics:
+
+```go
+client, err := httpclient.New(httpclient.Config{
+    Peer:    "payment-api",
+    BaseURL: paymentURL,
+    OnRetry: func(event httpclient.RetryEvent) {
+        retryCounter.WithLabelValues(event.Peer, string(event.Method)).Inc()
+    },
+    OnResult: func(ctx context.Context, event httpclient.ResultEvent) {
+        requestDuration.WithLabelValues(
+            event.Peer,
+            string(event.Method),
+            event.Outcome,
+        ).Observe(event.Duration.Seconds())
+    },
+})
+```
+
+Jangan memakai URL, trace ID, user ID, atau path parameter sebagai label metrics.
+Hook berjalan synchronous dan harus cepat serta aman dipanggil concurrent.
+
+## Config utama
 
 | Field | Default | Keterangan |
 |---|---|---|
-| `Peer` | – | Nama logis pihak ketiga, di-log sebagai `peer`. |
-| `Timeout` | 30s | Total budget satu `Do` (semua attempt). Negatif = tanpa timeout. |
-| `PerAttemptTimeout` | 0 (off) | Batas satu attempt; attempt yang hang bisa di-retry dalam `Timeout`. |
-| `MaxRetries` / `DisableRetry` | 2 / false | Retry setelah attempt pertama (maks 3 attempt). |
-| `InitialBackoff` / `MaxBackoff` | 100ms / 2s | Exponential backoff + jitter (antara d/2 dan d). |
-| `RetryStatuses` | 429, 500, 502, 503, 504 | Slice kosong non-nil = hanya retry transport error. |
-| `RetryNonIdempotent` | false | Izinkan retry POST/PATCH tanpa `Idempotency-Key`. |
-| `ShouldRetry` | – | Ganti aturan status/error dengan logika sendiri. Jangan baca `resp.Body` di dalamnya — response bisa dikembalikan ke pemanggil. |
-| `OnRetry` | – | Callback tiap kali attempt akan di-retry (`RetryEvent`: attempt, status/error, wait). Untuk metrics. |
-| `Transport` | clone `http.DefaultTransport` | Base transport; jika diisi, field tuning di bawah diabaikan. |
-| `DialTimeout` / `TLSHandshakeTimeout` | 5s / 5s | |
-| `ResponseHeaderTimeout` | 10s | Peer yang tidak mengirim header dalam batas ini dianggap gagal dan bisa di-retry. Negatif = tanpa batas. |
-| `MaxIdleConnsPerHost` / `MaxConnsPerHost` | 10 / 0 (unlimited) | Default net/http hanya 2 idle conn per host. |
-| `TLSClientConfig` | – | Root CA kustom, client certificate (mTLS), dll. Di-clone. |
-| `Proxy` | `http.ProxyFromEnvironment` | Pemilih proxy per request. |
-| `DisableLogging`, `DisablePropagation`, `LogHeaders`, `Redactor` | – | Diteruskan ke `logger.NewHTTPTransport`. |
+| `Peer` | wajib | Nama logis upstream. |
+| `BaseURL` | wajib | HTTP(S), tanpa credentials/query/fragment. |
+| `DefaultHeaders` | kosong | Header yang berlaku untuk semua request. |
+| `Auth` | kosong | Bearer, Basic, API key, atau token provider. |
+| `MaxResponseBodyBytes` | 4 MiB | Batas response yang dibuffer. |
+| `Timeout` | 30s | Total logical request; negatif untuk disable. |
+| `PerAttemptTimeout` | off | Batas satu attempt. |
+| `MaxRetries` | 2 | Retry setelah request pertama. |
+| `InitialBackoff` / `MaxBackoff` | 100ms / 2s | Exponential equal-jitter. |
+| `RetryStatuses` | 429, 502, 503, 504 | Slice kosong berarti transport error saja. |
+| `ResponseHeaderTimeout` | 10s | Batas menunggu header. |
+| `MaxIdleConnsPerHost` | 10 | Pool per upstream. |
+| `FollowRedirects` | false | Hanya same-origin bila diaktifkan. |
+| `DisableLogging` | false | Menonaktifkan final log dan retry debug. |
+| `DisablePropagation` | false | Menonaktifkan `X-Request-ID`. |
 
-## Aturan retry
-
-Request di-retry hanya jika **semua** terpenuhi:
-
-1. Method idempotent (`GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, `DELETE`), atau ada header `Idempotency-Key` / `X-Idempotency-Key`, atau `RetryNonIdempotent: true`.
-2. Body bisa diulang — `http.NewRequest` otomatis mengisi `GetBody` untuk `*bytes.Buffer`, `*bytes.Reader`, `*strings.Reader`. Body lain (mis. `io.Pipe`) hanya dikirim sekali.
-3. Hasilnya transport error (kecuali error sertifikat TLS) atau status di `RetryStatuses`.
-4. Context request belum selesai dan backoff berikutnya masih muat dalam sisa `Timeout`.
-5. `Retry-After` (429/503) tidak lebih lama dari `MaxBackoff` — kalau lebih lama, response langsung dikembalikan.
-
-Jika retry habis, **response terakhir dikembalikan apa adanya** (cek `StatusCode` seperti biasa), atau error transport terakhir.
-
-### Metrics
-
-```go
-retries := prometheus.NewCounterVec(prometheus.CounterOpts{Name: "http_client_retries_total"}, []string{"peer", "status"})
-
-c := httpclient.New(httpclient.Options{
-	Peer: "client_webhook",
-	OnRetry: func(e httpclient.RetryEvent) {
-		retries.WithLabelValues(e.Peer, strconv.Itoa(e.StatusCode)).Inc() // status 0 = transport error
-	},
-})
-```
-
-### mTLS / CA internal
-
-```go
-cert, err := tls.LoadX509KeyPair("client.crt", "client.key")
-// ...
-c := httpclient.New(httpclient.Options{
-	Peer:            "partner_api",
-	TLSClientConfig: &tls.Config{Certificates: []tls.Certificate{cert}, RootCAs: caPool},
-})
-```
-
-## Logging
-
-Setiap attempt menghasilkan satu baris `http outbound` dari `logger` (level info / warn untuk 4xx-5xx & lambat / error untuk transport error). Attempt ke-2 dst. membawa field `attempt`. Keputusan retry di-log di level debug (`http outbound retrying`, dengan `backoff_ms`).
-
-```json
-{"level":"warn","msg":"http outbound error status","trace_id":"…","layer":"client","peer":"client_webhook","method":"POST","status_code":503,"duration_ms":41.2}
-{"level":"info","msg":"http outbound","trace_id":"…","layer":"client","peer":"client_webhook","attempt":2,"method":"POST","status_code":200,"duration_ms":38.7}
-```
+Panggil `client.CloseIdleConnections()` saat graceful shutdown bila perlu.

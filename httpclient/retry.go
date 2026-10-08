@@ -8,9 +8,11 @@ import (
 	"io"
 	"math"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"slices"
 	"strconv"
+	"syscall"
 	"time"
 
 	"go.uber.org/zap"
@@ -29,14 +31,16 @@ const maxDrainBytes = 64 << 10
 const maxRetryAfterSeconds = int64(math.MaxInt64 / time.Second)
 
 // RetryEvent describes a failed attempt that is about to be retried; see
-// Options.OnRetry.
+// Config.OnRetry. Err is for programmatic classification and should not be
+// logged directly because transport errors can contain destination details.
 type RetryEvent struct {
-	Request    *http.Request // the attempt's request; read-only
-	Peer       string        // Options.Peer
-	Attempt    int           // the attempt that just failed (1 = first)
-	StatusCode int           // response status, 0 when Err is set
-	Err        error         // transport error, nil when a response was received
-	Wait       time.Duration // backoff (or Retry-After) before the next attempt
+	Peer       string
+	Method     Method
+	Operation  string
+	Attempt    int
+	StatusCode int
+	Err        error
+	Wait       time.Duration
 }
 
 // Overridable in tests.
@@ -47,10 +51,10 @@ var (
 
 type retryTransport struct {
 	next http.RoundTripper
-	opts Options
+	opts Config
 }
 
-func newRetryTransport(next http.RoundTripper, opts Options) *retryTransport {
+func newRetryTransport(next http.RoundTripper, opts Config) *retryTransport {
 	return &retryTransport{next: next, opts: opts}
 }
 
@@ -62,6 +66,9 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	for attempt := 1; ; attempt++ {
+		if state := stateFromContext(ctx); state != nil {
+			state.attempts.Store(int32(attempt))
+		}
 		areq := req
 		if attempt > 1 {
 			areq = req.Clone(logger.WithFields(ctx, zap.Int(KeyAttempt, attempt)))
@@ -95,13 +102,20 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			return resp, err // not enough budget left for another attempt
 		}
 
-		logger.FromContext(ctx).Debug("http outbound retrying",
-			zap.String(logger.KeyPeer, t.opts.Peer),
-			zap.Int(KeyAttempt, attempt+1),
-			zap.Float64("backoff_ms", float64(wait)/float64(time.Millisecond)),
-		)
+		if !t.opts.DisableLogging {
+			logCtx := logger.WithFields(ctx, zap.String(logger.KeyLayer, logger.LayerClient))
+			logger.FromContext(logCtx).Debug("http outbound retrying",
+				zap.String(logger.KeyPeer, t.opts.Peer),
+				zap.Int(KeyAttempt, attempt+1),
+				zap.Float64("backoff_ms", float64(wait)/float64(time.Millisecond)),
+			)
+		}
 		if t.opts.OnRetry != nil {
-			ev := RetryEvent{Request: areq, Peer: t.opts.Peer, Attempt: attempt, Err: err, Wait: wait}
+			ev := RetryEvent{Peer: t.opts.Peer, Attempt: attempt, Err: err, Wait: wait}
+			if state := stateFromContext(ctx); state != nil {
+				ev.Method = state.method
+				ev.Operation = state.operation
+			}
 			if resp != nil {
 				ev.StatusCode = resp.StatusCode
 			}
@@ -161,30 +175,43 @@ func isIdempotent(req *http.Request) bool {
 }
 
 func (t *retryTransport) shouldRetry(resp *http.Response, err error) bool {
-	if t.opts.ShouldRetry != nil {
-		return t.opts.ShouldRetry(resp, err)
-	}
 	if err != nil {
 		return isRetryableError(err)
 	}
 	return slices.Contains(t.opts.RetryStatuses, resp.StatusCode)
 }
 
-// isRetryableError treats transport errors as transient except certificate
-// problems, which will not fix themselves on the next attempt.
+// isRetryableError is deliberately conservative: deterministic configuration,
+// TLS and permanent DNS errors should not be amplified with retries.
 func isRetryableError(err error) bool {
 	var (
 		certErr     *tls.CertificateVerificationError
 		unknownAuth x509.UnknownAuthorityError
 		hostErr     x509.HostnameError
 		invalidErr  x509.CertificateInvalidError
+		dnsErr      *net.DNSError
+		netErr      net.Error
 	)
 	switch {
+	case errors.Is(err, context.Canceled):
+		return false
 	case errors.As(err, &certErr), errors.As(err, &unknownAuth),
 		errors.As(err, &hostErr), errors.As(err, &invalidErr):
 		return false
+	case errors.Is(err, context.DeadlineExceeded):
+		return true
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		return true
+	case errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.ECONNREFUSED),
+		errors.Is(err, syscall.EPIPE), errors.Is(err, syscall.ETIMEDOUT),
+		errors.Is(err, syscall.ENETUNREACH), errors.Is(err, syscall.EHOSTUNREACH):
+		return true
+	case errors.As(err, &dnsErr):
+		return dnsErr.Timeout() || dnsErr.Temporary()
+	case errors.As(err, &netErr):
+		return netErr.Timeout() || netErr.Temporary()
 	}
-	return true
+	return false
 }
 
 // backoff returns the wait before attempt+1: exponential from InitialBackoff,

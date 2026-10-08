@@ -4,12 +4,15 @@ Kumpulan library Go reusable untuk kebutuhan service: logging, HTTP client, mess
 
 Module: `github.com/go-dto/go-common`
 
+Minimum Go version: **1.26.6** (includes standard-library security fixes used by
+the networking packages).
+
 ## Package
 
 | Package | Status | Deskripsi |
 |---|---|---|
 | [`logger`](logger/README.md) | ✅ stabil | Logger terstruktur berbasis zap: tracing lintas layer (`StartOp`), propagasi `X-Request-ID`, redaksi data sensitif, rotasi file, HTTP transport ber-log, monitor MongoDB (`logger/mongolog`). |
-| [`httpclient`](httpclient/README.md) | 🧪 baru | HTTP client standar: timeout, connection pool, retry/backoff (idempotency-aware, `Retry-After`), logging per attempt via `logger`. |
+| [`httpclient`](httpclient/README.md) | 🧪 baru | HTTP client high-level: method/header/query/body helper tanpa lifecycle `net/http`, timeout, pool, retry aman, typed error, response auto-close, dan satu final log per logical request. |
 | [`broker`](broker/README.md) | 🧪 baru | Publish/subscribe netral-backend: propagasi `trace_id`/`span_id` lewat atribut pesan, log per pesan, ack/nack + `Permanent`, panic recovery, timeout handler. Driver: `broker/gcppubsub` (Google Pub/Sub), `broker/memory` (test/dev). |
 | [`database`](database/README.md) | 🧪 baru | Inisialisasi MySQL (`*sql.DB`), PostgreSQL (`*pgxpool.Pool` + query tracer), MongoDB (`*mongo.Client` + `mongolog`): default timeout & pool, ping dengan retry saat startup, `HealthHandler` untuk readiness probe, tanpa kredensial/argumen query di log. |
 
