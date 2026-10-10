@@ -13,6 +13,7 @@ import (
 |---|---|---|
 | `broker` | API inti: `Broker`, `Message`, `Handler`, `Middleware`, `Permanent` | hanya `logger` |
 | `broker/gcppubsub` | Google Cloud Pub/Sub (production) | `cloud.google.com/go/pubsub/v2` |
+| [`broker/redis`](redis/README.md) | Redis Streams consumer groups (production) | `github.com/redis/go-redis/v9` |
 | `broker/memory` | Unit test & dev lokal, in-process | – |
 
 Dependency GCP hanya ikut ter-compile jika `broker/gcppubsub` di-import.
@@ -23,6 +24,7 @@ Dependency GCP hanya ikut ter-compile jika `broker/gcppubsub` di-import.
 Broker  (trace, log, Op, panic recovery, timeout, middleware, Permanent → ack)
   └─ Driver interface  (Publish / Receive / Close)
        ├─ gcppubsub.Driver
+       ├─ redis.Driver
        └─ memory.Driver
 ```
 

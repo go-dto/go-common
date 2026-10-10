@@ -149,3 +149,141 @@ jobs:
           POSTGRES_TEST_DSN: 'postgres://postgres:pw@127.0.0.1:5432/postgres?sslmode=disable'
           MONGODB_TEST_URI: 'mongodb://127.0.0.1:27017'
         run: go test ./database/...
+
+  redis-integration:
+    name: Redis integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      redis:
+        image: redis:8.2.2-alpine@sha256:59b6e694653476de2c992937ebe1c64182af4728e54bb49e9b7a6c26614d8933
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+          cache: true
+
+      - name: Test real Redis cache and queue drivers
+        env:
+          REDIS_TEST_ADDR: '127.0.0.1:6379'
+        run: go test -count=1 ./cache/redis ./broker/redis
+
+  redis-secure-integration:
+    name: Redis TLS and auth integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+          cache: true
+
+      - name: Generate ephemeral Redis TLS material
+        shell: bash
+        run: |
+          cert_dir="$RUNNER_TEMP/go-common-redis-tls"
+          mkdir -p "$cert_dir"
+          openssl req -x509 -nodes -newkey rsa:2048 \
+            -keyout "$cert_dir/ca.key" -out "$cert_dir/ca.crt" -days 1 \
+            -subj '/CN=go-common Redis integration CA'
+          openssl req -nodes -newkey rsa:2048 \
+            -keyout "$cert_dir/server.key" -out "$cert_dir/server.csr" \
+            -subj '/CN=localhost' \
+            -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1'
+          openssl x509 -req -in "$cert_dir/server.csr" \
+            -CA "$cert_dir/ca.crt" -CAkey "$cert_dir/ca.key" \
+            -CAcreateserial -out "$cert_dir/server.crt" -days 1 \
+            -copy_extensions copy
+          chmod 644 "$cert_dir/ca.crt" "$cert_dir/server.crt" "$cert_dir/server.key"
+          redis_password="$(openssl rand -hex 24)"
+          echo "::add-mask::$redis_password"
+          echo "REDIS_TEST_PASSWORD=$redis_password" >> "$GITHUB_ENV"
+          echo "REDIS_TEST_TLS_CA=$cert_dir/ca.crt" >> "$GITHUB_ENV"
+          echo 'REDIS_TEST_TLS_SERVER_NAME=localhost' >> "$GITHUB_ENV"
+          echo 'REDIS_TEST_ADDR=127.0.0.1:6380' >> "$GITHUB_ENV"
+
+      - name: Start durable Redis with TLS and authentication
+        shell: bash
+        run: |
+          cert_dir="$RUNNER_TEMP/go-common-redis-tls"
+          docker run --detach --name go-common-redis-tls \
+            --publish 6380:6379 \
+            --volume "$cert_dir:/tls:ro" \
+            redis:8.2.2-alpine@sha256:59b6e694653476de2c992937ebe1c64182af4728e54bb49e9b7a6c26614d8933 \
+            redis-server \
+              --port 0 \
+              --tls-port 6379 \
+              --tls-cert-file /tls/server.crt \
+              --tls-key-file /tls/server.key \
+              --tls-ca-cert-file /tls/ca.crt \
+              --tls-auth-clients no \
+              --requirepass "$REDIS_TEST_PASSWORD" \
+              --appendonly yes \
+              --appendfsync everysec \
+              --maxmemory-policy noeviction
+          for attempt in {1..30}; do
+            if docker exec \
+              -e REDISCLI_AUTH="$REDIS_TEST_PASSWORD" \
+              go-common-redis-tls \
+              redis-cli --tls --cacert /tls/ca.crt -h localhost ping >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs go-common-redis-tls
+          exit 1
+
+      - name: Test Redis cache and queue over verified TLS
+        run: go test -count=1 ./cache/redis ./broker/redis
+
+      - name: Verify Redis restart and reconnect startup
+        shell: bash
+        run: |
+          docker exec \
+            -e REDISCLI_AUTH="$REDIS_TEST_PASSWORD" \
+            go-common-redis-tls \
+            redis-cli --tls --cacert /tls/ca.crt -h localhost \
+              set go-common:restart-probe retained >/dev/null
+          docker restart go-common-redis-tls >/dev/null
+          for attempt in {1..30}; do
+            if docker exec \
+              -e REDISCLI_AUTH="$REDIS_TEST_PASSWORD" \
+              go-common-redis-tls \
+              redis-cli --tls --cacert /tls/ca.crt -h localhost ping >/dev/null; then
+              persisted="$(docker exec \
+                -e REDISCLI_AUTH="$REDIS_TEST_PASSWORD" \
+                go-common-redis-tls \
+                redis-cli --tls --cacert /tls/ca.crt -h localhost \
+                  get go-common:restart-probe)"
+              if [[ "$persisted" != retained ]]; then
+                echo 'Redis persistence probe was not retained after restart'
+                exit 1
+              fi
+              go test -count=1 ./cache/redis ./broker/redis
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs go-common-redis-tls
+          exit 1
+
+      - name: Stop secure Redis
+        if: always()
+        run: docker rm --force go-common-redis-tls >/dev/null 2>&1 || true

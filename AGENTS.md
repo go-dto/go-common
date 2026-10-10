@@ -4,6 +4,10 @@ Aturan ini berlaku untuk seluruh repository `go-common`. AI coding agent wajib
 membaca file ini dan `docs/PRODUCTION_IMPLEMENTATION.md` sebelum menambah atau
 mengubah integrasi package.
 
+Aturan untuk AI agent yang mengintegrasikan library ini ke repository service
+berada di [`docs/AGENTS_INTEGRATION.md`](docs/AGENTS_INTEGRATION.md). File ini
+sendiri tetap menjadi aturan contributor/maintainer repository `go-common`.
+
 ## Tujuan repository
 
 `go-common` adalah library infrastruktur publik, bukan tempat business logic
@@ -16,10 +20,12 @@ Package utama:
   redaction, dan Mongo command monitor.
 - `httpclient`: HTTP client high-level dengan total timeout, retry aman, response
   body bounded, typed error, dan sanitized logging.
+- `cache`: kontrak cache bounded serta driver memory dan Redis dengan TTL,
+  typed miss/error, TLS, pool, readiness, dan privacy-safe observability.
 - `database`: koneksi, startup retry, readiness, dan production validation untuk
   MySQL, PostgreSQL, dan MongoDB.
 - `broker`: publish/subscribe, trace propagation, handler timeout, panic
-  isolation, ack/nack, dan graceful shutdown.
+  isolation, ack/nack, Redis Streams reclaim/DLQ, dan graceful shutdown.
 
 ## Aturan sebelum mengubah kode
 
@@ -86,6 +92,21 @@ Package utama:
 - Migrasi MongoDB driver v1 ke v2 harus mengubah `database/mongodb` dan
   `logger/mongolog` bersama-sama; jangan migrasi salah satunya saja.
 
+### Cache
+
+- Gunakan `cache.Store` sebagai dependency service dan `cache/memory` pada unit
+  test. Production Redis memakai `cache/redis` dengan config/pool khusus cache.
+- Panggil `cache/redis.Config.ValidateProduction()` sebelum `New`; verified TLS,
+  startup ping, timeout, pool bound, namespace prefix, TTL, serta size limit
+  wajib aktif.
+- `cache.ErrMiss` adalah control flow normal. Error lain ditangani melalui
+  `cache.KindOf`/`IsTimeout`, bukan parse string.
+- Jangan log cache key/value. Identifier sensitif tidak boleh menjadi raw key;
+  gunakan key terderivasi sesuai threat model service.
+- Jangan berbagi client/pool atau deployment production dengan Redis queue.
+- Readiness cache hanya wajib jika service tidak dapat beroperasi secara
+  fail-open tanpa cache.
+
 ### Broker
 
 - Panggil `gcppubsub.Config.ValidateProduction()` sebelum `gcppubsub.New`.
@@ -99,6 +120,20 @@ Package utama:
 - Retry policy dan dead-letter topic dibuat di broker/IaC, bukan loop manual di
   handler.
 - Jangan log payload, message attributes, atau ordering key.
+- Redis queue memakai `broker/redis` berbasis Streams consumer groups, bukan
+  Redis Pub/Sub. Panggil `ValidateProductionWithOptions()`, provision
+  stream/group melalui IaC, dan gunakan consumer name unik per pod.
+- Untuk Redis Streams, `ClaimMinIdle` wajib lebih besar dari `HandlerTimeout`.
+  Pilih `StreamMaxLen` dari worst-case backlog dan monitor pending/DLQ agar
+  trimming tidak menghilangkan payload yang masih dibutuhkan.
+- Redis queue production wajib `noeviction`, persistence sesuai RPO,
+  replication/HA, backup/restore dan failover drill, ACL least-privilege, serta
+  alert untuk persistence error, replication lag, retry, pending, dan DLQ.
+- Worker memasang `broker/redis.ConsumerCheck` sebagai readiness setelah
+  subscriber dimulai; publisher-only memakai `broker/redis.Check`. Jangan pakai
+  dependency readiness sebagai liveness.
+- Cache dan queue Redis harus memakai credential, client/pool, dan idealnya
+  deployment terpisah; logical DB/prefix bukan resource isolation.
 
 ## Urutan bootstrap service
 
@@ -106,12 +141,12 @@ Package utama:
 load env/config
   -> ValidateProduction semua config
   -> Init logger
-  -> buat reusable HTTP client / DB pool / broker
+  -> buat reusable HTTP client / DB pool / cache / broker
   -> pasang /readyz dan business routes
   -> pasang HTTP middleware dengan route template
   -> start server/consumer
   -> SIGTERM: stop accepting work
-  -> shutdown HTTP, broker, HTTP idle connections, DB, logger dengan deadline
+  -> shutdown HTTP, broker, cache, HTTP idle connections, DB, logger dengan deadline
 ```
 
 Gunakan contoh siap-adaptasi di
@@ -152,6 +187,8 @@ git diff --check
   privacy, serta concurrency bila relevan.
 - Jalankan database integration test dengan MySQL, PostgreSQL, dan MongoDB nyata
   bila mengubah driver, pool, TLS, ping, atau health check.
+- Jalankan integration test Redis nyata bila mengubah cache Redis, Streams,
+  claim, ack, DLQ, pool, TLS, ping, atau health check.
 - Laporkan tepat mana yang lulus, skip, atau tidak tersedia. Jangan menyatakan
   release-ready jika worktree belum menjadi commit, CI commit tersebut belum
   hijau, integration test belum berjalan, atau belum ada tag versi yang sesuai.

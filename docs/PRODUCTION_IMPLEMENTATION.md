@@ -4,13 +4,21 @@ Dokumen ini adalah referensi implementasi untuk developer dan AI coding agent.
 Contoh memakai API publik saat ini dan sengaja tidak memuat credential, payload
 medis, atau alamat internal.
 
+Catatan release: `cache/redis` dan `broker/redis` tersedia mulai `v0.2.0`. Pin
+service ke tag semver yang benar-benar memuat package tersebut; jangan memakai
+branch atau pseudo-version untuk production.
+
+Untuk aturan siap-salin ke `AGENTS.md` repository service, gunakan
+[`AGENTS_INTEGRATION.md`](AGENTS_INTEGRATION.md). Aturan contributor yang
+mengembangkan library tetap berada di [`../AGENTS.md`](../AGENTS.md).
+
 ## Alur startup dan shutdown
 
 ```text
 configuration
   -> production validation
   -> logger
-  -> database + outbound client + broker
+  -> database + outbound client + cache + broker
   -> readiness + application routes
   -> HTTP server / subscriber
   -> graceful shutdown dengan deadline
@@ -321,16 +329,162 @@ defer func() {
 }()
 ```
 
+## Contoh Redis cache
+
+Cache dan queue menggunakan connection/pool terpisah. Jangan memakai identifier
+pasien mentah sebagai key dan jangan log key/value.
+
+```go
+cacheConfig := rediscache.Config{
+	Addrs:      []string{os.Getenv("CACHE_REDIS_ADDR")},
+	Username:   os.Getenv("CACHE_REDIS_USERNAME"),
+	Password:   os.Getenv("CACHE_REDIS_PASSWORD"),
+	KeyPrefix:  "patient-api:cache:",
+	DefaultTTL: 5 * time.Minute,
+	TLSConfig: &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		ServerName: os.Getenv("CACHE_REDIS_SERVER_NAME"),
+	},
+	PoolSize:       20,
+	MinIdleConns:   2,
+	MaxActiveConns: 20,
+	MaxKeyBytes:    256,
+	MaxValueBytes:  256 << 10,
+	MaxDeleteKeys:  100,
+}
+if err := cacheConfig.ValidateProduction(); err != nil {
+	return err
+}
+patientCache, err := rediscache.New(ctx, cacheConfig)
+if err != nil {
+	return err
+}
+defer patientCache.Close()
+
+value, err := patientCache.Get(ctx, cacheKey)
+if errors.Is(err, cache.ErrMiss) {
+	// Load source of truth lalu Set dengan TTL.
+}
+```
+
+Tambahkan import:
+
+```go
+import (
+	"crypto/tls"
+
+	"github.com/go-dto/go-common/cache"
+	rediscache "github.com/go-dto/go-common/cache/redis"
+)
+```
+
+## Contoh Redis Streams queue
+
+Provision stream dan consumer group melalui IaC terlebih dahulu, misalnya:
+
+```text
+XGROUP CREATE order-service:queue:{topic:jobs}:stream order-worker 0 MKSTREAM
+```
+
+```go
+queueConfig := redisbroker.Config{
+	Addrs:      []string{os.Getenv("QUEUE_REDIS_ADDR")},
+	Username:   os.Getenv("QUEUE_REDIS_USERNAME"),
+	Password:   os.Getenv("QUEUE_REDIS_PASSWORD"),
+	KeyPrefix:  "order-service:queue:",
+	TLSConfig: &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		ServerName: os.Getenv("QUEUE_REDIS_SERVER_NAME"),
+	},
+	Topics:       []string{"jobs"},
+	ConsumerName: os.Getenv("POD_NAME"),
+	Subscriptions: map[string]redisbroker.Subscription{
+		"order-worker": {Topic: "jobs", Group: "order-worker"},
+	},
+	PoolSize:            30,
+	MinIdleConns:        2,
+	MaxActiveConns:      30,
+	Concurrency:         20,
+	ReadBatchSize:       20,
+	BlockTimeout:        time.Second,
+	ClaimMinIdle:        time.Minute,
+	MaxDeliveryAttempts: 5,
+	StreamMaxLen:        500_000,
+	DeadLetterMaxLen:    50_000,
+}
+brokerOptions := broker.Options{
+	HandlerTimeout: 30 * time.Second,
+}
+if err := queueConfig.ValidateProductionWithOptions(brokerOptions); err != nil {
+	return err
+}
+queue, err := redisbroker.New(ctx, queueConfig, brokerOptions)
+if err != nil {
+	return err
+}
+defer func() {
+	closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = queue.CloseContext(closeCtx)
+}()
+
+_, err = queue.Publish(ctx, "jobs", &broker.Message{Data: encodedJob})
+if err != nil {
+	return err
+}
+
+err = queue.Subscribe(workerCtx, "order-worker",
+	func(ctx context.Context, message *broker.Message) error {
+		var job Job
+		if err := json.Unmarshal(message.Data, &job); err != nil {
+			return broker.Permanent(errors.New("invalid job payload"))
+		}
+		return orderService.HandleJob(ctx, job)
+	},
+)
+```
+
+Tambahkan import:
+
+```go
+import (
+	"encoding/json"
+
+	"github.com/go-dto/go-common/broker"
+	redisbroker "github.com/go-dto/go-common/broker/redis"
+)
+```
+
+`ClaimMinIdle` harus lebih besar dari `HandlerTimeout`. Handler tetap idempotent;
+error transient dibiarkan pending lalu di-claim ulang, sedangkan message yang
+mencapai batas attempt dipindahkan ke DLQ stream secara atomik. Pantau panjang
+stream, pending age/count, DLQ, memory, serta pool saturation. Detail lengkap
+ada di [`../broker/redis/README.md`](../broker/redis/README.md).
+
+Pasang `redisbroker.ConsumerCheck` pada readiness worker setelah goroutine
+subscriber dimulai. Gunakan `redisbroker.Check` hanya pada process
+publisher-only. Keduanya bukan liveness check.
+
+Deployment queue Redis wajib memakai `noeviction`, persistence sesuai RPO,
+replication/managed HA, backup/restore dan failover drill, ACL least-privilege,
+serta alert untuk persistence error, replication lag, receive retry, pending
+age/count, dan DLQ. `StreamMaxLen` adalah batas jumlah entry; hitung dari peak
+rate dan outage window, bukan menganggapnya sebagai retention waktu.
+
 ## Checklist deployment
 
 - Semua config menjalankan `ValidateProduction()`.
+- Redis cache dan Redis queue memakai credential, pool, prefix, serta idealnya
+  deployment terpisah.
+- Redis queue memakai `noeviction`, persistence/HA/backup yang teruji, ACL
+  minimum, capacity plan backlog, dan readiness consumer-group/receiver.
 - Tidak ada raw path/URL/body/header/query/SQL/ordering key pada log.
 - Semua network call memiliki context dan deadline.
 - Pool dihitung terhadap kapasitas dependency dan jumlah replica.
 - `/readyz` memeriksa dependency; `/livez` hanya kondisi proses.
 - POST/PATCH retry menggunakan idempotency key.
 - Subscriber idempotent serta memiliki retry/dead-letter policy.
-- Shutdown HTTP, broker, idle connection, database, dan logger bounded.
+- Shutdown HTTP, broker, cache, idle connection, database, dan logger bounded.
 - `go test -race`, Staticcheck, govulncheck, secret scan, coverage, dan integration
   test untuk commit release semuanya hijau.
 - Release memakai commit bersih dan tag semver immutable.

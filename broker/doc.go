@@ -3,6 +3,7 @@
 // Drivers in sub-packages:
 //
 //   - gcppubsub: Google Cloud Pub/Sub (production);
+//   - redis: Redis Streams consumer groups (production);
 //   - memory: in-process, for unit tests and local development.
 //
 // Only the imported driver is compiled in, so services that do not use
@@ -40,7 +41,8 @@
 //   - Options.HandlerTimeout cancels each call through its ctx. Handlers must
 //     honour cancellation because Go cannot forcibly stop a goroutine.
 //
-// Retry backoff and dead lettering are broker-side policies (Pub/Sub
-// subscription retry policy and dead letter topic); Message.DeliveryAttempt
-// reports the attempt number when the broker provides it.
+// Retry and dead lettering are backend-specific: Pub/Sub uses subscription
+// policies, while the Redis Streams driver reclaims stale pending messages and
+// moves exhausted deliveries to its DLQ stream. Message.DeliveryAttempt reports
+// the attempt number when the backend provides it.
 package broker
