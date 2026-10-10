@@ -54,10 +54,11 @@ type Options struct {
 
 // Driver is safe for concurrent use.
 type Driver struct {
-	opts   Options
-	ctx    context.Context // cancelled by Close
-	cancel context.CancelFunc
-	wg     sync.WaitGroup // active Receive calls
+	opts         Options
+	ctx          context.Context // cancelled by Close
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup // active Receive calls
+	redeliveries sync.WaitGroup
 
 	mu        sync.Mutex
 	closed    bool
@@ -65,6 +66,9 @@ type Driver struct {
 	subs      map[string]*subscription
 	topics    map[string][]*subscription
 	published map[string][]broker.Message
+
+	closeOnce sync.Once
+	closeDone chan struct{}
 }
 
 type subscription struct {
@@ -93,6 +97,7 @@ func New(opts Options) *Driver {
 		subs:      make(map[string]*subscription),
 		topics:    make(map[string][]*subscription),
 		published: make(map[string][]broker.Message),
+		closeDone: make(chan struct{}),
 	}
 }
 
@@ -214,14 +219,29 @@ func (d *Driver) settle(s *subscription, m *broker.Message, err error) {
 		s.queue = append(s.queue, m)
 	default:
 		s.delayed++
-		time.AfterFunc(d.opts.RedeliveryDelay, func() {
-			d.mu.Lock()
-			defer d.mu.Unlock()
-			s.delayed--
-			s.queue = append(s.queue, m)
-			s.notify()
-		})
+		d.redeliveries.Add(1)
+		go d.redeliver(s, m, d.opts.RedeliveryDelay)
 	}
+}
+
+func (d *Driver) redeliver(s *subscription, m *broker.Message, delay time.Duration) {
+	defer d.redeliveries.Done()
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	ready := false
+	select {
+	case <-timer.C:
+		ready = true
+	case <-d.ctx.Done():
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	s.delayed--
+	if ready && !d.closed {
+		s.queue = append(s.queue, m)
+	}
+	s.notify()
 }
 
 // WaitIdle blocks until subscription has no queued, in-flight or
@@ -270,16 +290,32 @@ func (d *Driver) DeadLetters(name string) []broker.Message {
 // Close stops every Receive (waiting for in-flight handlers) and makes
 // further Publish/Receive calls return broker.ErrClosed.
 func (d *Driver) Close() error {
-	d.mu.Lock()
-	if d.closed {
-		d.mu.Unlock()
-		return nil
+	return d.CloseContext(context.Background())
+}
+
+// CloseContext is Close with a bounded wait. Cleanup continues after ctx
+// expires, including cancellation of pending redelivery timers.
+func (d *Driver) CloseContext(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("memory: nil close context")
 	}
-	d.closed = true
-	d.mu.Unlock()
-	d.cancel()
-	d.wg.Wait()
-	return nil
+	d.closeOnce.Do(func() {
+		d.mu.Lock()
+		d.closed = true
+		d.mu.Unlock()
+		d.cancel()
+		go func() {
+			d.wg.Wait()
+			d.redeliveries.Wait()
+			close(d.closeDone)
+		}()
+	})
+	select {
+	case <-d.closeDone:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // notify wakes everything waiting on s. d.mu must be held.

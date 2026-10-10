@@ -199,6 +199,70 @@ func TestClose(t *testing.T) {
 	}
 }
 
+func TestCloseCancelsPendingRedelivery(t *testing.T) {
+	d := New(Options{RedeliveryDelay: time.Hour, MaxDeliveryAttempts: -1})
+	_ = d.CreateSubscription("sub", "topic")
+	handled := make(chan struct{})
+	receive(t, d, "sub", func(context.Context, *broker.Message) error {
+		close(handled)
+		return errors.New("retry")
+	})
+	_, _ = d.Publish(context.Background(), "topic", &broker.Message{})
+	<-handled
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		d.mu.Lock()
+		delayed := d.subs["sub"].delayed
+		d.mu.Unlock()
+		if delayed == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("message never entered delayed redelivery")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.subs["sub"].delayed != 0 || len(d.subs["sub"].queue) != 0 {
+		t.Fatalf("pending redelivery survived Close: %+v", d.subs["sub"])
+	}
+}
+
+func TestCloseContextBoundsUncooperativeHandler(t *testing.T) {
+	d := New(Options{})
+	_ = d.CreateSubscription("sub", "topic")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- d.Receive(context.Background(), "sub", func(context.Context, *broker.Message) error {
+			close(started)
+			<-release
+			return nil
+		})
+	}()
+	_, _ = d.Publish(context.Background(), "topic", &broker.Message{})
+	<-started
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := d.CloseContext(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("CloseContext error=%v", err)
+	}
+	close(release)
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestErrors(t *testing.T) {
 	d := New(Options{})
 	defer d.Close()

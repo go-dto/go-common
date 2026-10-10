@@ -4,7 +4,7 @@
 // startup ping with retry.
 //
 //	pool, err := postgres.Open(ctx, postgres.Config{
-//		Host: "10.0.0.6", User: "svc", Password: pw, Database: "fhir", SSLMode: "require",
+//		Host: "10.0.0.6", User: "svc", Password: pw, Database: "fhir", SSLMode: "verify-full",
 //	})
 //	if err != nil { ... }
 //	defer pool.Close()
@@ -51,7 +51,8 @@ type Config struct {
 	Password string
 	Database string
 	// SSLMode: disable | allow | prefer | require | verify-ca | verify-full.
-	// Empty = pgx default (prefer). Use require or stricter in production.
+	// Empty = pgx default (prefer). Use verify-full with ValidateProduction in
+	// production unless a trusted local proxy intentionally terminates TLS.
 	SSLMode string
 
 	// ApplicationName shows up in pg_stat_activity.
@@ -111,8 +112,34 @@ func Open(ctx context.Context, cfg Config) (*pgxpool.Pool, error) {
 	return pool, nil
 }
 
+// ValidateProduction validates the effective connection settings without
+// opening a socket. Every primary/fallback address must use TLS with server
+// certificate verification. Applications using a trusted local proxy may
+// intentionally skip this stricter validation.
+func (cfg Config) ValidateProduction() error {
+	pc, err := poolConfig(cfg)
+	if err != nil {
+		return err
+	}
+	cc := pc.ConnConfig
+	if cc.TLSConfig == nil || cc.TLSConfig.InsecureSkipVerify {
+		return errors.New("postgres: production connections require verified TLS")
+	}
+	for _, fallback := range cc.Fallbacks {
+		if fallback.TLSConfig == nil || fallback.TLSConfig.InsecureSkipVerify {
+			return errors.New("postgres: production fallback connections require verified TLS")
+		}
+	}
+	return nil
+}
+
 // Check returns a health check that pings pool.
 func Check(name string, pool *pgxpool.Pool) database.Check {
+	if pool == nil {
+		return database.Check{Name: name, Ping: func(context.Context) error {
+			return errors.New("postgres: nil pool")
+		}}
+	}
 	return database.Check{Name: name, Ping: pool.Ping}
 }
 

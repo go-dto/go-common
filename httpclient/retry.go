@@ -102,6 +102,11 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			return resp, err // not enough budget left for another attempt
 		}
 
+		if resp != nil {
+			// Release the connection before invoking application hooks. A slow
+			// hook must not keep the previous attempt's body open.
+			drainAndClose(resp.Body)
+		}
 		if !t.opts.DisableLogging {
 			logCtx := logger.WithFields(ctx, zap.String(logger.KeyLayer, logger.LayerClient))
 			logger.FromContext(logCtx).Debug("http outbound retrying",
@@ -119,10 +124,9 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			if resp != nil {
 				ev.StatusCode = resp.StatusCode
 			}
-			t.opts.OnRetry(ev)
-		}
-		if resp != nil {
-			drainAndClose(resp.Body)
+			invokeHook(ctx, t.opts.DisableLogging, t.opts.Peer, "OnRetry", func() {
+				t.opts.OnRetry(ev)
+			})
 		}
 		if serr := sleep(ctx, wait); serr != nil {
 			if err == nil {
@@ -138,6 +142,12 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 func (t *retryTransport) roundTripOnce(req *http.Request) (_ *http.Response, timedOut bool, _ error) {
 	if t.opts.PerAttemptTimeout <= 0 {
 		resp, err := t.next.RoundTrip(req)
+		if err == nil && resp == nil {
+			return nil, false, errors.New("httpclient: transport returned a nil response")
+		}
+		if err == nil && resp.Body == nil {
+			resp.Body = http.NoBody
+		}
 		return resp, false, err
 	}
 	actx, cancel := context.WithTimeout(req.Context(), t.opts.PerAttemptTimeout)
@@ -146,6 +156,13 @@ func (t *retryTransport) roundTripOnce(req *http.Request) (_ *http.Response, tim
 		timedOut = errors.Is(actx.Err(), context.DeadlineExceeded) && req.Context().Err() == nil
 		cancel()
 		return nil, timedOut, err
+	}
+	if resp == nil {
+		cancel()
+		return nil, false, errors.New("httpclient: transport returned a nil response")
+	}
+	if resp.Body == nil {
+		resp.Body = http.NoBody
 	}
 	resp.Body = &cancelBody{ReadCloser: resp.Body, cancel: cancel}
 	return resp, false, nil
@@ -178,6 +195,9 @@ func (t *retryTransport) shouldRetry(resp *http.Response, err error) bool {
 	if err != nil {
 		return isRetryableError(err)
 	}
+	if resp == nil {
+		return false
+	}
 	return slices.Contains(t.opts.RetryStatuses, resp.StatusCode)
 }
 
@@ -207,9 +227,9 @@ func isRetryableError(err error) bool {
 		errors.Is(err, syscall.ENETUNREACH), errors.Is(err, syscall.EHOSTUNREACH):
 		return true
 	case errors.As(err, &dnsErr):
-		return dnsErr.Timeout() || dnsErr.Temporary()
+		return dnsErr.Timeout()
 	case errors.As(err, &netErr):
-		return netErr.Timeout() || netErr.Temporary()
+		return netErr.Timeout()
 	}
 	return false
 }
@@ -219,6 +239,10 @@ func isRetryableError(err error) bool {
 func (t *retryTransport) backoff(attempt int) time.Duration {
 	d := t.opts.InitialBackoff
 	for i := 1; i < attempt && d < t.opts.MaxBackoff; i++ {
+		if d >= t.opts.MaxBackoff-d {
+			d = t.opts.MaxBackoff
+			break
+		}
 		d *= 2
 	}
 	d = min(d, t.opts.MaxBackoff)

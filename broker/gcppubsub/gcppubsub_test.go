@@ -226,6 +226,26 @@ func TestConfigValidation(t *testing.T) {
 	}
 }
 
+func TestValidateProduction(t *testing.T) {
+	t.Setenv("PUBSUB_EMULATOR_HOST", "")
+	if err := (Config{ProjectID: "prod-project"}).ValidateProduction(); err != nil {
+		t.Fatalf("valid production config: %v", err)
+	}
+	for name, cfg := range map[string]Config{
+		"missing project": {},
+		"injected client": {ProjectID: "prod-project", Client: &pubsub.Client{}},
+		"client options":  {ProjectID: "prod-project", ClientOptions: []option.ClientOption{option.WithoutAuthentication()}},
+	} {
+		if err := cfg.ValidateProduction(); err == nil {
+			t.Errorf("%s: expected error", name)
+		}
+	}
+	t.Setenv("PUBSUB_EMULATOR_HOST", "127.0.0.1:8085")
+	if err := (Config{ProjectID: "prod-project"}).ValidateProduction(); err == nil {
+		t.Fatal("production must reject the emulator")
+	}
+}
+
 func TestFromPubsub(t *testing.T) {
 	n := 3
 	now := time.Now()

@@ -5,16 +5,29 @@ package ctxid
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
+	"sync/atomic"
+	"time"
 )
 
 // Header is the HTTP header carrying the correlation id, on inbound requests
 // (set by echo's RequestID middleware) and on outbound calls.
 const Header = "X-Request-ID"
 
+// MaxLength bounds externally supplied request IDs before they are copied into
+// contexts, response headers, and logs.
+const MaxLength = 128
+
 type ctxKey struct{}
 
 var requestIDKey ctxKey
+
+var (
+	readRandom      = rand.Read
+	fallbackCounter atomic.Uint64
+)
 
 // WithContext returns a copy of ctx carrying id.
 func WithContext(ctx context.Context, id string) context.Context {
@@ -34,10 +47,40 @@ func FromContext(ctx context.Context) (string, bool) {
 	return id, ok && id != ""
 }
 
+// Valid reports whether an externally supplied request ID is safe to use.
+// IDs are intentionally limited to a small, portable character set to avoid
+// control characters, unbounded log fields, and high-cardinality garbage.
+func Valid(id string) bool {
+	if len(id) == 0 || len(id) > MaxLength {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			continue
+		}
+		switch c {
+		case '-', '.', '_', ':':
+			continue
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // New returns a random 32-character hex id (same length as echo's RequestID).
 func New() string {
 	var b [16]byte
-	_, _ = rand.Read(b[:]) // crypto/rand.Read does not fail on supported platforms
+	if n, err := readRandom(b[:]); err != nil || n != len(b) {
+		// Correlation IDs are not credentials, but they still must remain unique
+		// when the operating-system random source is temporarily unavailable.
+		var seed [16]byte
+		binary.BigEndian.PutUint64(seed[:8], uint64(time.Now().UnixNano()))
+		binary.BigEndian.PutUint64(seed[8:], fallbackCounter.Add(1))
+		sum := sha256.Sum256(seed[:])
+		copy(b[:], sum[:len(b)])
+	}
 	return hex.EncodeToString(b[:])
 }
 

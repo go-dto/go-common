@@ -114,11 +114,14 @@ func WithRequestID(reqID string) *zap.Logger {
 }
 
 func WithRequest(r *http.Request) *zap.Logger {
-	return logger.L().With(
+	l := logger.L().With(
 		zap.String("method", r.Method),
 		zap.String("host", r.Host),
-		zap.String("path", r.URL.Path),
 	)
+	if r.Pattern != "" {
+		l = l.With(zap.String(logger.KeyRoute, r.Pattern))
+	}
+	return l
 }
 
 func SugaredWithRequest(r *http.Request) *zap.SugaredLogger { return WithRequest(r).Sugar() }

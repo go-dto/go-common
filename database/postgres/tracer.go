@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
@@ -37,14 +38,25 @@ type QueryLogOptions struct {
 	SlowThreshold time.Duration
 
 	// MaxStatementBytes truncates db_statement. Default 1000.
+	// It is used only when IncludeStatement is true.
 	MaxStatementBytes int
+
+	// IncludeStatement adds normalized SQL text to logs. It is false by
+	// default because SQL assembled with literals may contain credentials or
+	// personal data even when query arguments are excluded.
+	IncludeStatement bool
 }
 
 // NewQueryTracer returns a pgx.QueryTracer that logs each Query/QueryRow/Exec
-// with the caller's context (trace_id, op, span_id, …). Only the SQL text is
-// logged — never the arguments, which may hold personal data.
+// with the caller's context (trace_id, op, span_id, …). Query arguments are
+// never logged. SQL text is omitted by default and must be explicitly enabled.
 func NewQueryTracer(opts QueryLogOptions) pgx.QueryTracer {
-	t := &queryTracer{successLevel: zapcore.DebugLevel, slow: DefaultSlowThreshold, maxBytes: DefaultMaxStatementBytes}
+	t := &queryTracer{
+		successLevel: zapcore.DebugLevel,
+		slow:         DefaultSlowThreshold,
+		maxBytes:     DefaultMaxStatementBytes,
+		statement:    opts.IncludeStatement,
+	}
 	if opts.SuccessLevel != nil {
 		t.successLevel = *opts.SuccessLevel
 	}
@@ -61,6 +73,7 @@ type queryTracer struct {
 	successLevel zapcore.Level
 	slow         time.Duration
 	maxBytes     int
+	statement    bool
 }
 
 type queryStartKey struct{}
@@ -99,16 +112,45 @@ func (t *queryTracer) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.T
 	}
 	fields := []zap.Field{
 		zap.String(logger.KeyDBSystem, database.SystemPostgreSQL),
-		zap.String(database.KeyStatement, normalizeSQL(qs.sql, t.maxBytes)),
 		zap.Float64(logger.KeyDurationMs, float64(d)/float64(time.Millisecond)),
 	}
+	if t.statement {
+		fields = append(fields, zap.String(database.KeyStatement, normalizeSQL(qs.sql, t.maxBytes)))
+	}
+	operation := statementOperation(qs.sql)
+	if tag := data.CommandTag.String(); tag != "" {
+		operation, _, _ = strings.Cut(tag, " ")
+	}
+	if operation != "" {
+		fields = append(fields, zap.String(database.KeyOperation, operation))
+	}
 	if err != nil {
-		fields = append(fields, zap.Error(err))
-	} else if tag := data.CommandTag.String(); tag != "" {
-		op, _, _ := strings.Cut(tag, " ")
-		fields = append(fields, zap.String(database.KeyOperation, op), zap.Int64(database.KeyRows, data.CommandTag.RowsAffected()))
+		fields = append(fields, zap.String("error_kind", "query"))
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code != "" {
+			fields = append(fields, zap.String("db_error_code", pgErr.Code))
+		}
+	} else if data.CommandTag.String() != "" {
+		fields = append(fields, zap.Int64(database.KeyRows, data.CommandTag.RowsAffected()))
 	}
 	ce.Write(fields...)
+}
+
+func statementOperation(sql string) string {
+	fields := strings.Fields(sql)
+	if len(fields) == 0 {
+		return ""
+	}
+	op := strings.ToUpper(fields[0])
+	if len(op) > 32 {
+		return ""
+	}
+	for _, r := range op {
+		if r < 'A' || r > 'Z' {
+			return ""
+		}
+	}
+	return op
 }
 
 // normalizeSQL collapses whitespace (multi-line queries become one line) and

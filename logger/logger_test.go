@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -50,7 +51,7 @@ func TestConfigFromEnv(t *testing.T) {
 		"LOG_FILE_PATH":         "/tmp/x.log",
 		"LOG_FILE_MAX_AGE_DAYS": "3",
 		"LOG_SAMPLING":          "100,10",
-		"LOG_CALLER":            "false",
+		"LOG_CALLER":            "true",
 		"LOG_FUNCTION":          "true",
 		"LOG_SLOW_OP_MS":        "250",
 	}
@@ -59,7 +60,7 @@ func TestConfigFromEnv(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.Level != "warn" || cfg.Format != "console" || cfg.ServiceName != "webhook" ||
-		len(cfg.Outputs) != 2 || cfg.File.MaxAge != 72*time.Hour || cfg.Sampling.Thereafter != 10 || cfg.EnableCaller ||
+		len(cfg.Outputs) != 2 || cfg.File.MaxAge != 72*time.Hour || cfg.Sampling.Thereafter != 10 || !cfg.EnableCaller ||
 		!cfg.EnableFunction || cfg.SlowOpThreshold != 250*time.Millisecond {
 		t.Fatalf("unexpected cfg: %+v", cfg)
 	}
@@ -74,11 +75,46 @@ func TestConfigValidation(t *testing.T) {
 		{"LOG_FILE_MAX_SIZE_MB": "abc"},
 		{"LOG_SAMPLING": "100"},
 		{"LOG_CALLER": "maybe"},
+		{"LOG_CALLER": "false", "LOG_FUNCTION": "true"},
 	}
 	for _, env := range bad {
 		if _, err := ConfigFromLookup(func(k string) (string, bool) { v, ok := env[k]; return v, ok }); err == nil {
 			t.Errorf("expected error for %v", env)
 		}
+	}
+}
+
+func TestConfigValidationProgrammaticAndProduction(t *testing.T) {
+	tests := []func(*Config){
+		func(c *Config) { c.SlowOpThreshold = -1 },
+		func(c *Config) { c.File.MaxSizeMB = -1 },
+		func(c *Config) { c.File.MaxBackups = -1 },
+		func(c *Config) { c.File.MaxAge = -1 },
+		func(c *Config) { c.Sampling = &SamplingConfig{} },
+		func(c *Config) { c.EnableCaller, c.EnableFunction = false, true },
+	}
+	for i, mutate := range tests {
+		cfg := DefaultConfig()
+		mutate(&cfg)
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("case %d: expected validation error", i)
+		}
+	}
+
+	cfg := DefaultConfig()
+	if err := cfg.ValidateProduction(); err == nil {
+		t.Fatal("production validation must require service metadata")
+	}
+	cfg.ServiceName, cfg.Environment = "svc", "production"
+	if err := cfg.ValidateProduction(); err != nil {
+		t.Fatalf("valid production config: %v", err)
+	}
+	cfg.Outputs = []string{OutputFile}
+	cfg.File.Path = "app.log"
+	cfg.File.MaxBackups = 0
+	cfg.File.MaxAge = 0
+	if err := cfg.ValidateProduction(); err == nil {
+		t.Fatal("production file output must require bounded retention")
 	}
 }
 
@@ -144,8 +180,9 @@ func TestFromContextAddsTraceIDAndFields(t *testing.T) {
 
 func TestFromContextNil(t *testing.T) {
 	observe(t)
-	//nolint:staticcheck // deliberately passing nil
+	//lint:ignore SA1012 deliberately testing the public nil-context boundary
 	FromContext(nil).Info("ok")
+	//lint:ignore SA1012 deliberately testing the public nil-context boundary
 	_ = WithFields(nil, zap.String("a", "b"))
 }
 
@@ -216,6 +253,55 @@ func TestConcurrentUse(t *testing.T) {
 	}
 	wg.Wait()
 	MustInit(DefaultConfig())
+}
+
+func TestAddHookCoversZapStdlogAndSurvivesReInit(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultConfig()
+	cfg.Outputs = []string{OutputFile}
+	cfg.File.Path = filepath.Join(dir, "hook-a.log")
+	MustInit(cfg)
+
+	var calls atomic.Int64
+	AddHook(func(zapcore.Entry) error {
+		calls.Add(1)
+		return nil
+	})
+	L().Info("logger global")
+	zap.L().Info("zap global")
+	log.Print("stdlib global")
+
+	cfg.File.Path = filepath.Join(dir, "hook-b.log")
+	MustInit(cfg)
+	L().Info("after reload")
+	if got := calls.Load(); got != 4 {
+		t.Fatalf("hook calls = %d, want 4", got)
+	}
+	_ = Close()
+	MustInit(DefaultConfig())
+}
+
+func TestAddHookPanicIsIsolated(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultConfig()
+	cfg.Outputs = []string{OutputFile}
+	cfg.File.Path = filepath.Join(dir, "hook-panic.log")
+	MustInit(cfg)
+
+	var after atomic.Int64
+	AddHook(
+		func(zapcore.Entry) error { panic("sensitive hook panic") },
+		func(zapcore.Entry) error { after.Add(1); return nil },
+	)
+	L().Info("application continues")
+	if after.Load() != 1 {
+		t.Fatal("a panicking hook must not prevent later hooks")
+	}
+	_ = Close()
+	MustInit(DefaultConfig())
+	if body := readFile(t, cfg.File.Path); !strings.Contains(body, "application continues") || strings.Contains(body, "sensitive hook panic") {
+		t.Fatalf("unexpected log output: %s", body)
+	}
 }
 
 func TestIgnoreBenignSyncErr(t *testing.T) {

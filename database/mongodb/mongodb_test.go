@@ -2,6 +2,7 @@ package mongodb
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"net"
 	"os"
@@ -92,6 +93,37 @@ func TestClientOptionsErrors(t *testing.T) {
 	boom := errors.New("boom")
 	if _, err := clientOptions(Config{URI: "mongodb://db", Configure: func(*options.ClientOptions) error { return boom }}); !errors.Is(err, boom) {
 		t.Errorf("Configure error = %v", err)
+	}
+	if _, err := clientOptions(Config{URI: "mongodb://db", MinPoolSize: 11, MaxPoolSize: 10}); err == nil {
+		t.Error("final minPoolSize > maxPoolSize must fail validation")
+	}
+	if _, err := clientOptions(Config{
+		URI: "mongodb://db",
+		Configure: func(o *options.ClientOptions) error {
+			o.SetMinPoolSize(20)
+			o.SetMaxPoolSize(10)
+			return nil
+		},
+	}); err == nil {
+		t.Error("invalid Configure result must fail final validation")
+	}
+}
+
+func TestValidateProduction(t *testing.T) {
+	if err := (Config{URI: "mongodb://db.internal:27017"}).ValidateProduction(); err == nil {
+		t.Fatal("plaintext production config should fail")
+	}
+	if err := (Config{
+		URI: "mongodb://db.internal:27017",
+		Configure: func(o *options.ClientOptions) error {
+			o.SetTLSConfig(&tls.Config{InsecureSkipVerify: true}) //nolint:gosec -- validation test
+			return nil
+		},
+	}).ValidateProduction(); err == nil {
+		t.Fatal("unverified production TLS should fail")
+	}
+	if err := (Config{URI: "mongodb://db.internal:27017/?tls=true"}).ValidateProduction(); err != nil {
+		t.Fatalf("verified production TLS: %v", err)
 	}
 }
 

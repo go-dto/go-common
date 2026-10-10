@@ -306,10 +306,25 @@ func (c *Client) Request(ctx context.Context, method Method, pathTemplate string
 	if err != nil {
 		return nil, wrapRequestError(KindInvalidRequest, c.cfg, method, requestCfg.operation, 0, err)
 	}
+	started := time.Now()
+	requestCtx, cancel := withLogicalTimeout(ctx, c.cfg.Timeout, requestCfg.requestTimeout)
+	if cancel != nil {
+		defer cancel()
+	}
 	if c.cfg.Auth != nil {
-		if err := c.cfg.Auth.apply(ctx, requestCfg.headers); err != nil {
-			clientErr := wrapRequestError(KindAuth, c.cfg, method, requestCfg.operation, 0, err)
-			c.logResult(ctx, resultEvent{method: method, operation: requestCfg.operation, outcome: "auth_error", err: clientErr})
+		if err := c.cfg.Auth.apply(requestCtx, requestCfg.headers); err != nil {
+			kind, outcome := KindAuth, "auth_error"
+			cause := err
+			if requestCtx.Err() != nil {
+				cause = requestCtx.Err()
+				kind = classifyCause(cause)
+				outcome = string(kind)
+			}
+			clientErr := wrapRequestError(kind, c.cfg, method, requestCfg.operation, 0, cause)
+			c.logResult(ctx, resultEvent{
+				method: method, operation: requestCfg.operation, duration: time.Since(started),
+				outcome: outcome, err: clientErr,
+			})
 			return nil, clientErr
 		}
 	}
@@ -317,12 +332,6 @@ func (c *Client) Request(ctx context.Context, method Method, pathTemplate string
 		requestCfg.headers.Set("Content-Type", requestCfg.contentType)
 	}
 
-	requestCtx := ctx
-	var cancel context.CancelFunc
-	if requestCfg.requestTimeout > 0 {
-		requestCtx, cancel = context.WithTimeout(ctx, requestCfg.requestTimeout)
-		defer cancel()
-	}
 	state := &requestState{method: method, operation: requestCfg.operation}
 	requestCtx = context.WithValue(requestCtx, requestStateKey{}, state)
 
@@ -336,7 +345,6 @@ func (c *Client) Request(ctx context.Context, method Method, pathTemplate string
 	}
 	request.Header = requestCfg.headers.Clone()
 
-	started := time.Now()
 	standardResponse, requestErr := c.client.Do(request)
 	duration := time.Since(started)
 	attempts := max(int(state.attempts.Load()), 1)
@@ -403,6 +411,17 @@ func (c *Client) Request(ctx context.Context, method Method, pathTemplate string
 		attempts: attempts, duration: duration, outcome: outcome,
 	})
 	return response, nil
+}
+
+func withLogicalTimeout(ctx context.Context, total, perRequest time.Duration) (context.Context, context.CancelFunc) {
+	timeout := total
+	if timeout <= 0 || perRequest > 0 && perRequest < timeout {
+		timeout = perRequest
+	}
+	if timeout <= 0 {
+		return ctx, nil
+	}
+	return context.WithTimeout(ctx, timeout)
 }
 
 func (cfg *requestConfig) accepts(statusCode int) bool {

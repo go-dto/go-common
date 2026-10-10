@@ -67,6 +67,9 @@ func BearerTokenProvider(provider TokenProvider) Authenticator {
 			if token == "" {
 				return errors.New("token provider returned an empty token")
 			}
+			if strings.ContainsAny(token, "\r\n") {
+				return errors.New("token provider returned a token containing a newline")
+			}
 			header.Set("Authorization", "Bearer "+token)
 			return nil
 		},

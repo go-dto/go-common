@@ -3,6 +3,8 @@ package broker_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -77,7 +79,7 @@ func TestTracePropagation(t *testing.T) {
 
 	ctx := ctxid.WithContext(context.Background(), "trace-1")
 	ctx, op := logger.StartOp(ctx, logger.LayerService, "webhook.Send")
-	id, err := b.Publish(ctx, "topic", &broker.Message{Data: []byte("hi")})
+	id, err := b.Publish(ctx, "topic", &broker.Message{Data: []byte("hi"), OrderingKey: "secret-patient-id"})
 	op.End(err)
 	if err != nil {
 		t.Fatal(err)
@@ -99,7 +101,8 @@ func TestTracePropagation(t *testing.T) {
 		t.Errorf("handled fields = %v", cm)
 	}
 	pub := logs.FilterMessage("broker publish").All()
-	if len(pub) != 1 || pub[0].ContextMap()[broker.KeyTopic] != "topic" || pub[0].ContextMap()[logger.KeyTraceID] != "trace-1" {
+	if len(pub) != 1 || pub[0].ContextMap()[broker.KeyTopic] != "topic" || pub[0].ContextMap()[logger.KeyTraceID] != "trace-1" ||
+		pub[0].ContextMap()[broker.KeyHasOrderingKey] != true || pub[0].ContextMap()[broker.KeyOrderingKey] != nil {
 		t.Errorf("publish lines = %v", pub)
 	}
 }
@@ -219,8 +222,70 @@ func TestPanicRecovered(t *testing.T) {
 		t.Errorf("panicking message should be nacked and redelivered, calls = %d", calls.Load())
 	}
 	lines := logs.FilterMessage("broker message nacked").All()
-	if len(lines) == 0 || lines[0].ContextMap()["stack"] == nil {
-		t.Errorf("nacked line should carry the stack: %v", lines)
+	if len(lines) == 0 {
+		t.Fatalf("missing nacked lines: %v", logs.All())
+	}
+	if _, exists := lines[0].ContextMap()["stack"]; exists {
+		t.Errorf("panic stack should be opt-in: %v", lines)
+	}
+	if strings.Contains(fmt.Sprint(logs.All()), "boom") {
+		t.Errorf("panic value leaked: %v", logs.All())
+	}
+}
+
+func TestPanicStackOptInStillOmitsValue(t *testing.T) {
+	logs := observe(t)
+	b, _, wait := setup(t, broker.Options{LogPanicStack: true}, memory.Options{MaxDeliveryAttempts: 1},
+		func(context.Context, *broker.Message) error { panic("sensitive panic value") })
+	if _, err := b.Publish(context.Background(), "topic", &broker.Message{}); err != nil {
+		t.Fatal(err)
+	}
+	wait()
+	lines := logs.FilterMessage("broker message nacked").All()
+	if len(lines) != 1 || lines[0].ContextMap()["stack"] == nil {
+		t.Fatalf("expected opt-in stack: %v", lines)
+	}
+	if strings.Contains(fmt.Sprint(logs.All()), "sensitive panic value") {
+		t.Fatalf("panic value leaked: %v", logs.All())
+	}
+}
+
+func TestInvalidPropagationMetadataIsReplaced(t *testing.T) {
+	observe(t)
+	got := make(chan struct{ trace, parent string }, 1)
+	b, d, wait := setup(t, broker.Options{}, memory.Options{}, func(ctx context.Context, _ *broker.Message) error {
+		trace, _ := ctxid.FromContext(ctx)
+		var parent string
+		for _, field := range logger.FieldsFromContext(ctx) {
+			if field.Key == logger.KeyParentSpanID {
+				parent = field.String
+			}
+		}
+		got <- struct{ trace, parent string }{trace, parent}
+		return nil
+	})
+	ctx := ctxid.WithContext(context.Background(), "trace-safe")
+	ctx, op := logger.StartOp(ctx, logger.LayerService, "publish")
+	msg := &broker.Message{Attributes: map[string]string{
+		broker.AttrTraceID: strings.Repeat("x", ctxid.MaxLength+1),
+		broker.AttrSpanID:  "not-a-span",
+	}}
+	if _, err := b.Publish(ctx, "topic", msg); err != nil {
+		t.Fatal(err)
+	}
+	op.End(nil)
+	wait()
+
+	published := d.Published("topic")[0]
+	if published.Attributes[broker.AttrTraceID] != "trace-safe" || published.Attributes[broker.AttrSpanID] != op.SpanID() {
+		t.Fatalf("sanitized attributes=%v", published.Attributes)
+	}
+	seen := <-got
+	if seen.trace != "trace-safe" || seen.parent != op.SpanID() {
+		t.Fatalf("consumer metadata=%+v", seen)
+	}
+	if msg.Attributes[broker.AttrSpanID] != "not-a-span" {
+		t.Fatal("caller's attributes were modified")
 	}
 }
 
@@ -344,6 +409,64 @@ func TestCloseStopsSubscribe(t *testing.T) {
 	}
 }
 
+func TestSubscribeResolvesLoggerAgainAfterReceiveStops(t *testing.T) {
+	firstCore, firstLogs := observer.New(zapcore.DebugLevel)
+	restoreFirst := logger.ReplaceForTest(zap.New(firstCore))
+	defer restoreFirst()
+
+	d := &controlledReceiveDriver{entered: make(chan struct{}), release: make(chan struct{})}
+	b := broker.New(d, broker.Options{System: "test"})
+	done := make(chan error, 1)
+	go func() {
+		done <- b.Subscribe(context.Background(), "sub", func(context.Context, *broker.Message) error { return nil })
+	}()
+	<-d.entered
+
+	secondCore, secondLogs := observer.New(zapcore.DebugLevel)
+	restoreSecond := logger.ReplaceForTest(zap.New(secondCore))
+	defer restoreSecond()
+	close(d.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+
+	if firstLogs.FilterMessage("broker subscriber started").Len() != 1 {
+		t.Fatalf("initial logger entries=%v", firstLogs.All())
+	}
+	if secondLogs.FilterMessage("broker subscriber stopped").Len() != 1 {
+		t.Fatalf("replacement logger entries=%v", secondLogs.All())
+	}
+}
+
+func TestCloseContextReturnsOnDeadlineAndCleanupContinues(t *testing.T) {
+	d := &blockingCloseDriver{started: make(chan struct{}), release: make(chan struct{})}
+	b := broker.New(d, broker.Options{})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := b.CloseContext(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("CloseContext error=%v", err)
+	}
+	<-d.started
+	close(d.release)
+	if err := b.Close(); err != nil {
+		t.Fatalf("eventual Close error=%v", err)
+	}
+}
+
+func TestNilDriverMessageIsDroppedWithoutPanic(t *testing.T) {
+	logs := observe(t)
+	b := broker.New(nilMessageDriver{}, broker.Options{System: "test"})
+	if err := b.Subscribe(context.Background(), "sub", func(context.Context, *broker.Message) error {
+		t.Fatal("application handler must not receive nil")
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if logs.FilterMessage("broker message dropped").Len() != 1 {
+		t.Fatalf("logs=%v", logs.All())
+	}
+}
+
 func TestPermanentHelpers(t *testing.T) {
 	if broker.Permanent(nil) != nil {
 		t.Error("Permanent(nil) should be nil")
@@ -361,3 +484,53 @@ func TestPermanentHelpers(t *testing.T) {
 		t.Error("plain error is not permanent")
 	}
 }
+
+type blockingCloseDriver struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (*blockingCloseDriver) Publish(context.Context, string, *broker.Message) (string, error) {
+	return "", nil
+}
+
+func (*blockingCloseDriver) Receive(ctx context.Context, _ string, _ broker.Handler) error {
+	<-ctx.Done()
+	return nil
+}
+
+func (d *blockingCloseDriver) Close() error {
+	d.once.Do(func() { close(d.started) })
+	<-d.release
+	return nil
+}
+
+type nilMessageDriver struct{}
+
+func (nilMessageDriver) Publish(context.Context, string, *broker.Message) (string, error) {
+	return "", nil
+}
+
+func (nilMessageDriver) Receive(ctx context.Context, _ string, h broker.Handler) error {
+	return h(ctx, nil)
+}
+
+func (nilMessageDriver) Close() error { return nil }
+
+type controlledReceiveDriver struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (*controlledReceiveDriver) Publish(context.Context, string, *broker.Message) (string, error) {
+	return "", nil
+}
+
+func (d *controlledReceiveDriver) Receive(context.Context, string, broker.Handler) error {
+	close(d.entered)
+	<-d.release
+	return nil
+}
+
+func (*controlledReceiveDriver) Close() error { return nil }

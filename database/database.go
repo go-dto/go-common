@@ -89,6 +89,9 @@ var sleep = func(ctx context.Context, d time.Duration) error {
 // fields identify the database in logs (db_system, db_host, db_name); never
 // pass credentials. Each failed ping is logged at warn, success at info.
 func WaitReady(ctx context.Context, r Retry, ping func(context.Context) error, fields ...zap.Field) error {
+	if ping == nil {
+		return errors.New("database: ping function is required")
+	}
 	r = r.withDefaults()
 	l := logger.FromContext(ctx).With(fields...)
 	start := time.Now()
@@ -108,18 +111,39 @@ func WaitReady(ctx context.Context, r Retry, ping func(context.Context) error, f
 			break
 		}
 		wait := backoff/2 + rand.N(backoff/2+1)
-		l.Warn("database not ready, retrying", zap.Int(KeyAttempt, attempt), zap.Duration("backoff", wait), zap.Error(err))
+		l.Warn("database not ready, retrying",
+			zap.Int(KeyAttempt, attempt), zap.Duration("backoff", wait), zap.String("error_kind", pingErrorKind(err)))
 		if serr := sleep(ctx, wait); serr != nil {
 			err = errors.Join(err, serr)
 			break
 		}
-		backoff = min(backoff*2, r.MaxBackoff)
+		if backoff >= r.MaxBackoff-backoff {
+			backoff = r.MaxBackoff
+		} else {
+			backoff *= 2
+		}
 	}
-	l.Error("database unreachable", zap.Error(err))
+	l.Error("database unreachable", zap.String("error_kind", pingErrorKind(err)))
 	return fmt.Errorf("database: not ready after %s: %w", time.Since(start).Round(time.Millisecond), err)
+}
+
+func pingErrorKind(err error) string {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	default:
+		return "ping"
+	}
 }
 
 // SQLCheck returns a health Check that pings db.
 func SQLCheck(name string, db *sql.DB) Check {
+	if db == nil {
+		return Check{Name: name, Ping: func(context.Context) error {
+			return errors.New("database: nil SQL database")
+		}}
+	}
 	return Check{Name: name, Ping: db.PingContext}
 }

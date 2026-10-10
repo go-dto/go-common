@@ -141,10 +141,12 @@ func stateFromContext(ctx context.Context) *requestState {
 
 func (c *Client) logResult(ctx context.Context, event resultEvent) {
 	if c.cfg.OnResult != nil {
-		c.cfg.OnResult(ctx, ResultEvent{
-			Peer: c.cfg.Peer, Method: event.method, Operation: event.operation,
-			StatusCode: event.statusCode, Attempts: event.attempts,
-			Duration: event.duration, Outcome: event.outcome, ErrorKind: KindOf(event.err),
+		invokeHook(ctx, c.cfg.DisableLogging, c.cfg.Peer, "OnResult", func() {
+			c.cfg.OnResult(ctx, ResultEvent{
+				Peer: c.cfg.Peer, Method: event.method, Operation: event.operation,
+				StatusCode: event.statusCode, Attempts: event.attempts,
+				Duration: event.duration, Outcome: event.outcome, ErrorKind: KindOf(event.err),
+			})
 		})
 	}
 	if c.cfg.DisableLogging {
@@ -186,6 +188,17 @@ func (c *Client) logResult(ctx context.Context, event resultEvent) {
 	if checked := log.Check(level, message); checked != nil {
 		checked.Write(fields...)
 	}
+}
+
+func invokeHook(ctx context.Context, disableLogging bool, peer, hook string, fn func()) {
+	defer func() {
+		if recover() != nil && !disableLogging {
+			logCtx := logger.WithFields(ctx, zap.String(logger.KeyLayer, logger.LayerClient))
+			logger.FromContext(logCtx).Error("httpclient hook panicked",
+				zap.String(logger.KeyPeer, peer), zap.String("hook", hook))
+		}
+	}()
+	fn()
 }
 
 // ResultEvent is the sanitized final result of one logical request, including

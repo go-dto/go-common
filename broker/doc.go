@@ -36,8 +36,9 @@
 //
 //   - nil → ack; error → nack (redelivered, at-least-once: be idempotent);
 //   - Permanent(err) → ack and drop, logged at error level;
-//   - panic → recovered, nacked, logged with stack;
-//   - Options.HandlerTimeout bounds each call through its ctx.
+//   - panic → recovered and nacked; panic values are never logged;
+//   - Options.HandlerTimeout cancels each call through its ctx. Handlers must
+//     honour cancellation because Go cannot forcibly stop a goroutine.
 //
 // Retry backoff and dead lettering are broker-side policies (Pub/Sub
 // subscription retry policy and dead letter topic); Message.DeliveryAttempt

@@ -9,7 +9,8 @@
 //
 // Each Open/Connect applies production defaults (timeouts, bounded pool,
 // connection recycling), pings with retry so a service started next to its
-// database does not crash-loop, and never puts credentials in logs or errors.
+// database does not crash-loop, and never puts credentials, query arguments,
+// or SQL statements in logs by default.
 //
 //	db, err := mysql.Open(ctx, mysql.Config{Host: h, User: u, Password: pw, Database: "webhook"})
 //	if err != nil { ... }

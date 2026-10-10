@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -27,9 +28,12 @@ const (
 	KeySubscription    = "subscription"
 	KeyMessageID       = "message_id"
 	KeyDeliveryAttempt = "delivery_attempt"
-	KeyOrderingKey     = "ordering_key"
-	KeyPayloadBytes    = "payload_bytes"
-	KeyLagMs           = "lag_ms" // publish → handler finished
+	// KeyOrderingKey is retained for source compatibility but is no longer
+	// emitted by default because ordering keys often contain business IDs.
+	KeyOrderingKey    = "ordering_key"
+	KeyHasOrderingKey = "has_ordering_key"
+	KeyPayloadBytes   = "payload_bytes"
+	KeyLagMs          = "lag_ms" // publish → handler finished
 )
 
 // Message is a broker-neutral message.
@@ -108,9 +112,9 @@ type Options struct {
 	// helpers fill it in.
 	System string
 
-	// HandlerTimeout bounds one handler call; the handler's ctx is cancelled
-	// when it expires. 0 = no limit (the driver may still enforce one, e.g.
-	// Pub/Sub's MaxExtension).
+	// HandlerTimeout cancels the handler's ctx when it expires. Go cannot stop
+	// a handler that ignores ctx, so CloseContext should also be bounded by the
+	// application's shutdown deadline. 0 = no timeout.
 	HandlerTimeout time.Duration
 
 	// Middleware wraps every handler passed to Subscribe, mws[0] outermost.
@@ -123,6 +127,11 @@ type Options struct {
 	// DisablePropagation stops writing AttrTraceID/AttrSpanID on publish and
 	// reading them on consume.
 	DisablePropagation bool
+
+	// LogPanicStack includes a Go stack trace when a handler panics. It is off
+	// by default because stack traces disclose source paths and implementation
+	// details. Panic values are never logged.
+	LogPanicStack bool
 }
 
 // Broker is the instrumented client used by application code. It is safe for
@@ -130,6 +139,10 @@ type Options struct {
 type Broker struct {
 	driver Driver
 	opts   Options
+
+	closeOnce sync.Once
+	closeDone chan struct{}
+	closeErr  error
 }
 
 var (
@@ -142,15 +155,35 @@ func New(d Driver, opts Options) *Broker {
 	if d == nil {
 		panic("broker: nil Driver")
 	}
-	return &Broker{driver: d, opts: opts}
+	return &Broker{driver: d, opts: opts, closeDone: make(chan struct{})}
 }
 
 // Driver returns the underlying driver, e.g. for driver-specific test helpers.
 func (b *Broker) Driver() Driver { return b.driver }
 
-// Close closes the driver: active Subscribe calls return and pending
-// publishes are flushed.
-func (b *Broker) Close() error { return b.driver.Close() }
+// Close closes the driver and waits for cleanup. Use CloseContext during
+// graceful shutdown when a handler might not honour context cancellation.
+func (b *Broker) Close() error { return b.CloseContext(context.Background()) }
+
+// CloseContext starts closing the driver exactly once and waits for cleanup or
+// ctx cancellation. Cleanup continues in the background if ctx expires.
+func (b *Broker) CloseContext(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("broker: nil close context")
+	}
+	b.closeOnce.Do(func() {
+		go func() {
+			b.closeErr = b.driver.Close()
+			close(b.closeDone)
+		}()
+	})
+	select {
+	case <-b.closeDone:
+		return b.closeErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 // Publish sends msg to topic and returns the broker-assigned message id. The
 // trace_id and span_id in ctx are added as attributes (msg itself is not
@@ -194,12 +227,14 @@ func (b *Broker) Subscribe(ctx context.Context, subscription string, h Handler) 
 	if h == nil {
 		return errors.New("broker: nil handler")
 	}
-	l := logger.FromContext(ctx).With(b.systemField(), zap.String(KeySubscription, subscription))
+	fields := []zap.Field{b.systemField(), zap.String(KeySubscription, subscription)}
 	if !b.opts.DisableLogging {
-		l.Info("broker subscriber started")
+		logger.FromContext(ctx).With(fields...).Info("broker subscriber started")
 	}
 	err := b.driver.Receive(ctx, subscription, b.consumer(subscription, Chain(h, b.opts.Middleware...)))
 	if !b.opts.DisableLogging {
+		// Resolve the logger again: Subscribe may outlive a logger re-init.
+		l := logger.FromContext(ctx).With(fields...)
 		if err != nil {
 			l.Error("broker subscriber failed", zap.Error(err))
 		} else {
@@ -216,6 +251,14 @@ func (b *Broker) Subscribe(ctx context.Context, subscription string, h Handler) 
 // panic recovery, one summary log line, and Permanent → ack.
 func (b *Broker) consumer(subscription string, h Handler) Handler {
 	return func(ctx context.Context, msg *Message) error {
+		if msg == nil {
+			err := errors.New("broker: driver delivered a nil message")
+			if !b.opts.DisableLogging {
+				logger.FromContext(ctx).Error("broker message dropped",
+					b.systemField(), zap.String(KeySubscription, subscription), zap.Error(err))
+			}
+			return nil
+		}
 		ctx = b.consumeContext(ctx, subscription, msg)
 		var op *logger.Op
 		if !b.opts.DisableLogging {
@@ -229,7 +272,7 @@ func (b *Broker) consumer(subscription string, h Handler) Handler {
 		}
 
 		start := time.Now()
-		err := safeCall(hctx, h, msg)
+		err := safeCall(hctx, h, msg, b.opts.LogPanicStack)
 		if op != nil {
 			op.End(err)
 			b.logConsume(ctx, msg, time.Since(start), err)
@@ -244,10 +287,10 @@ func (b *Broker) consumer(subscription string, h Handler) Handler {
 func (b *Broker) consumeContext(ctx context.Context, subscription string, msg *Message) context.Context {
 	fields := make([]zap.Field, 0, 5)
 	if !b.opts.DisablePropagation {
-		if id := msg.Attributes[AttrTraceID]; id != "" {
+		if id := msg.Attributes[AttrTraceID]; ctxid.Valid(id) {
 			ctx = ctxid.WithContext(ctx, id)
 		}
-		if span := msg.Attributes[AttrSpanID]; span != "" {
+		if span := msg.Attributes[AttrSpanID]; validSpanID(span) {
 			fields = append(fields, zap.String(logger.KeyParentSpanID, span))
 		}
 	}
@@ -277,7 +320,7 @@ func (b *Broker) logPublish(ctx context.Context, topic string, msg *Message, id 
 		zap.Float64(logger.KeyDurationMs, ms(d)),
 	)
 	if msg.OrderingKey != "" {
-		fields = append(fields, zap.String(KeyOrderingKey, msg.OrderingKey))
+		fields = append(fields, zap.Bool(KeyHasOrderingKey, true))
 	}
 
 	l := logger.FromContext(ctx).WithOptions(zap.WithCaller(false))
@@ -311,7 +354,7 @@ func (b *Broker) logConsume(ctx context.Context, msg *Message, d time.Duration, 
 	if err != nil {
 		fields = append(fields, zap.Error(err))
 		var pe *PanicError
-		if errors.As(err, &pe) {
+		if errors.As(err, &pe) && b.opts.LogPanicStack {
 			fields = append(fields, zap.ByteString("stack", pe.Stack))
 		}
 		if IsPermanent(err) {
@@ -330,6 +373,12 @@ func (b *Broker) systemField() zap.Field { return zap.String(KeySystem, b.opts.S
 
 // inject adds the trace attributes from ctx without overriding existing ones.
 func inject(ctx context.Context, attrs map[string]string) map[string]string {
+	if id := attrs[AttrTraceID]; id != "" && !ctxid.Valid(id) {
+		delete(attrs, AttrTraceID)
+	}
+	if span := attrs[AttrSpanID]; span != "" && !validSpanID(span) {
+		delete(attrs, AttrSpanID)
+	}
 	set := func(k, v string) {
 		if v == "" || attrs[k] != "" {
 			return
@@ -339,11 +388,27 @@ func inject(ctx context.Context, attrs map[string]string) map[string]string {
 		}
 		attrs[k] = v
 	}
-	if id, ok := ctxid.FromContext(ctx); ok {
+	if id, ok := ctxid.FromContext(ctx); ok && ctxid.Valid(id) {
 		set(AttrTraceID, id)
 	}
-	set(AttrSpanID, logger.SpanIDFromContext(ctx))
+	if span := logger.SpanIDFromContext(ctx); validSpanID(span) {
+		set(AttrSpanID, span)
+	}
 	return attrs
+}
+
+func validSpanID(id string) bool {
+	if len(id) != 16 {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func hasKey(fields []zap.Field, key string) bool {

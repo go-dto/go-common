@@ -3,6 +3,8 @@ package logger
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"sync"
@@ -41,7 +43,6 @@ import (
 type Op struct {
 	spanID string
 	ctx    context.Context
-	log    *zap.Logger
 	start  time.Time
 	ended  atomic.Bool
 }
@@ -69,7 +70,7 @@ func StartOp(ctx context.Context, layer, name string, fields ...zap.Field) (cont
 
 	base := FromContext(ctx)
 	// Caller skips: StartOp -> user (1); write -> end -> End/Done -> user (3).
-	op := &Op{spanID: spanID, ctx: ctx, log: base.WithOptions(zap.AddCallerSkip(3)), start: time.Now()}
+	op := &Op{spanID: spanID, ctx: ctx, start: time.Now()}
 	if ce := base.WithOptions(zap.AddCallerSkip(1)).Check(zapcore.DebugLevel, "op started"); ce != nil {
 		ce.Write()
 	}
@@ -77,6 +78,11 @@ func StartOp(ctx context.Context, layer, name string, fields ...zap.Field) (cont
 }
 
 type spanKey struct{}
+
+var (
+	readSpanRandom      = rand.Read
+	spanFallbackCounter atomic.Uint64
+)
 
 // SpanIDFromContext returns the span_id of the innermost Op in ctx ("" if none).
 func SpanIDFromContext(ctx context.Context) string {
@@ -89,7 +95,15 @@ func SpanIDFromContext(ctx context.Context) string {
 
 func newSpanID() string {
 	var b [8]byte
-	_, _ = rand.Read(b[:])
+	if n, err := readSpanRandom(b[:]); err != nil || n != len(b) {
+		// Span IDs are correlation data rather than credentials, but they must
+		// remain unique if the operating-system random source is unavailable.
+		var seed [16]byte
+		binary.BigEndian.PutUint64(seed[:8], uint64(time.Now().UnixNano()))
+		binary.BigEndian.PutUint64(seed[8:], spanFallbackCounter.Add(1))
+		sum := sha256.Sum256(seed[:])
+		copy(b[:], sum[:len(b)])
+	}
 	return hex.EncodeToString(b[:])
 }
 
@@ -142,7 +156,10 @@ func (o *Op) end(err error, fields []zap.Field) {
 }
 
 func (o *Op) write(lvl zapcore.Level, msg string, fields []zap.Field) {
-	if ce := o.log.Check(lvl, msg); ce != nil {
+	// Resolve at write time so an operation that spans a configuration reload
+	// never writes its completion line through a logger whose file was closed.
+	l := FromContext(o.ctx).WithOptions(zap.AddCallerSkip(3))
+	if ce := l.Check(lvl, msg); ce != nil {
 		ce.Write(fields...)
 	}
 }

@@ -30,6 +30,18 @@ if err != nil {
 }
 ```
 
+Untuk startup production, validasi HTTPS, certificate verification, timeout,
+dan batas koneksi sebelum membuat client. Validator menolak custom `Transport`
+karena keamanan TLS transport arbitrer tidak dapat diperiksa oleh package:
+
+```go
+clientConfig := httpclient.Config{Peer: "payment-api", BaseURL: cfg.PaymentURL}
+if err := clientConfig.ValidateProduction(); err != nil {
+    return err
+}
+paymentClient, err := httpclient.New(clientConfig)
+```
+
 Untuk konfigurasi startup yang sudah pasti valid, tersedia
 `httpclient.MustNew`.
 
@@ -266,7 +278,7 @@ client, err := httpclient.New(httpclient.Config{
 ```
 
 Jangan memakai URL, trace ID, user ID, atau path parameter sebagai label metrics.
-Hook berjalan synchronous dan harus cepat serta aman dipanggil concurrent.
+Hook berjalan synchronous dan harus cepat serta aman dipanggil concurrent. Panic dari hook diisolasi dan tidak menggagalkan request; panic value tidak dicatat. Sebelum `OnRetry` dipanggil, response attempt sebelumnya sudah di-drain dan ditutup agar hook lambat tidak menahan koneksi. Hook yang tidak pernah kembali tetap dapat menahan caller, sehingga jangan melakukan network I/O tanpa context/deadline di dalam hook.
 
 ## Config utama
 
@@ -277,13 +289,14 @@ Hook berjalan synchronous dan harus cepat serta aman dipanggil concurrent.
 | `DefaultHeaders` | kosong | Header yang berlaku untuk semua request. |
 | `Auth` | kosong | Bearer, Basic, API key, atau token provider. |
 | `MaxResponseBodyBytes` | 4 MiB | Batas response yang dibuffer. |
-| `Timeout` | 30s | Total logical request; negatif untuk disable. |
+| `Timeout` | 30s | Total logical request, termasuk token provider, retry, backoff, dan body read; negatif hanya untuk dev/test. |
 | `PerAttemptTimeout` | off | Batas satu attempt. |
 | `MaxRetries` | 2 | Retry setelah request pertama. |
 | `InitialBackoff` / `MaxBackoff` | 100ms / 2s | Exponential equal-jitter. |
 | `RetryStatuses` | 429, 502, 503, 504 | Slice kosong berarti transport error saja. |
 | `ResponseHeaderTimeout` | 10s | Batas menunggu header. |
 | `MaxIdleConnsPerHost` | 10 | Pool per upstream. |
+| `MaxConnsPerHost` | 100 | Batas seluruh koneksi aktif dan idle per upstream. |
 | `FollowRedirects` | false | Hanya same-origin bila diaktifkan. |
 | `DisableLogging` | false | Menonaktifkan final log dan retry debug. |
 | `DisablePropagation` | false | Menonaktifkan `X-Request-ID`. |

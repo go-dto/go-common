@@ -24,5 +24,7 @@
 //
 // Client applies bounded timeouts, pooled connections, conservative retries,
 // same-origin redirect policy, X-Request-ID propagation, response-size limits,
-// typed errors and one sanitized final log per logical request.
+// typed errors and one sanitized final log per logical request. Call
+// Config.ValidateProduction at startup when the upstream must use verified
+// HTTPS.
 package httpclient

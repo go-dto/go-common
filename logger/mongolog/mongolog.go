@@ -5,8 +5,9 @@
 //	clientOpts := options.Client().ApplyURI(uri).
 //		SetMonitor(mongolog.NewMonitor(mongolog.Options{}))
 //
-// Command bodies and replies are never logged (they may contain payloads or
-// secrets); only command name, database, collection, duration and failure.
+// Command bodies, replies, and raw driver failures are never logged (they may
+// contain payloads, key values, or secrets); only command name, database,
+// collection, duration, and a stable error kind are recorded.
 // "caller" is omitted on these lines because it would point into the driver;
 // the op field (from logger.StartOp in the repository) identifies the call site.
 package mongolog
@@ -128,6 +129,6 @@ func (m *monitor) failed(ctx context.Context, e *event.CommandFailedEvent) {
 	if m.skip(e.CommandName) {
 		return
 	}
-	f := append(m.fields(&e.CommandFinishedEvent), zap.String(logger.KeyError, e.Failure))
+	f := append(m.fields(&e.CommandFinishedEvent), zap.String("error_kind", "mongo_command"))
 	logger.FromContext(ctx).WithOptions(zap.WithCaller(false)).Warn("mongo command failed", f...)
 }

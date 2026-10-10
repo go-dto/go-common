@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -130,6 +131,9 @@ func (rf *RotatingFile) Close() error {
 func (rf *RotatingFile) Rotate() error {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	if rf.file == nil {
+		return errors.New("logger: rotate closed file")
+	}
 	return rf.rotate()
 }
 
@@ -143,7 +147,11 @@ func (rf *RotatingFile) rotate() error {
 	}
 	ext := filepath.Ext(rf.path)
 	base := strings.TrimSuffix(rf.path, ext)
-	backup := fmt.Sprintf("%s-%s%s", base, rf.now().Format(backupTimeFormat), ext)
+	backup, err := nextBackupPath(base, ext, rf.now())
+	if err != nil {
+		reopenErr := rf.openExisting()
+		return errors.Join(err, reopenErr)
+	}
 	if err := os.Rename(rf.path, backup); err != nil && !os.IsNotExist(err) {
 		reopenErr := rf.openExisting()
 		return errors.Join(fmt.Errorf("rename active log: %w", err), reopenErr)
@@ -167,6 +175,22 @@ func (rf *RotatingFile) rotate() error {
 	return nil
 }
 
+func nextBackupPath(base, ext string, now time.Time) (string, error) {
+	prefix := fmt.Sprintf("%s-%s", base, now.Format(backupTimeFormat))
+	for i := 0; i < 10_000; i++ {
+		candidate := prefix + ext
+		if i > 0 {
+			candidate = fmt.Sprintf("%s-%03d%s", prefix, i, ext)
+		}
+		if _, err := os.Lstat(candidate); os.IsNotExist(err) {
+			return candidate, nil
+		} else if err != nil {
+			return "", fmt.Errorf("logger: inspect backup path: %w", err)
+		}
+	}
+	return "", errors.New("logger: no unique backup filename available")
+}
+
 // cleanup removes backups beyond maxBackups or older than maxAge.
 func (rf *RotatingFile) cleanup() {
 	if rf.maxBackups <= 0 && rf.maxAge <= 0 {
@@ -185,7 +209,7 @@ func (rf *RotatingFile) cleanup() {
 	var backups []backup
 	for _, m := range matches {
 		ts := strings.TrimSuffix(strings.TrimPrefix(m, base+"-"), ext)
-		t, err := time.ParseInLocation(backupTimeFormat, ts, time.Local)
+		t, err := parseBackupTime(ts)
 		if err != nil {
 			continue // not one of ours
 		}
@@ -204,4 +228,17 @@ func (rf *RotatingFile) cleanup() {
 			_ = os.Remove(b.path)
 		}
 	}
+}
+
+func parseBackupTime(ts string) (time.Time, error) {
+	if t, err := time.ParseInLocation(backupTimeFormat, ts, time.Local); err == nil {
+		return t, nil
+	}
+	// Collision suffixes are generated as -001, -002, ... .
+	if len(ts) > 4 && ts[len(ts)-4] == '-' {
+		if _, err := strconv.Atoi(ts[len(ts)-3:]); err == nil {
+			return time.ParseInLocation(backupTimeFormat, ts[:len(ts)-4], time.Local)
+		}
+	}
+	return time.Time{}, fmt.Errorf("logger: invalid backup timestamp %q", ts)
 }

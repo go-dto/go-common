@@ -33,19 +33,26 @@ Service cukup bergantung pada interface `broker.Publisher` / `broker.Subscriber`
 ### Inisialisasi (sekali saat startup)
 
 ```go
-b, err := gcppubsub.New(ctx, gcppubsub.Config{
+pubsubConfig := gcppubsub.Config{
 	ProjectID: cfg.GCPProject,
 	ReceiveSettings: &pubsub.ReceiveSettings{MaxOutstandingMessages: 20}, // concurrency handler
-}, broker.Options{
+}
+if err := pubsubConfig.ValidateProduction(); err != nil {
+	return err
+}
+b, err := gcppubsub.New(ctx, pubsubConfig, broker.Options{
 	HandlerTimeout: 30 * time.Second,
 })
 if err != nil {
 	return err
 }
-defer b.Close() // menghentikan Subscribe, menunggu handler selesai, flush publish
+defer b.Close() // fallback; graceful shutdown sebaiknya memakai CloseContext
 ```
 
 Untuk emulator lokal cukup set `PUBSUB_EMULATOR_HOST=localhost:8085`.
+`ValidateProduction` menolak emulator, injected client, dan arbitrary
+`ClientOptions`; gunakan ADC dan endpoint Google standar untuk jalur yang dapat
+divalidasi library.
 
 ### Publish
 
@@ -88,8 +95,8 @@ err := b.Subscribe(ctx, "webhook-dispatch-sub", func(ctx context.Context, m *bro
 | `nil` | ack | info `broker message handled` |
 | error biasa | nack → dikirim ulang | error `op failed` (sekali) + warn `broker message nacked` |
 | `broker.Permanent(err)` | ack, pesan dibuang | error `broker message dropped` |
-| panic | di-recover, nack | warn `broker message nacked` + `stack` |
-| melewati `HandlerTimeout` | ctx handler dibatalkan; hasil sesuai return handler | – |
+| panic | di-recover, nack | panic value tidak dicatat; stack hanya jika `LogPanicStack=true` |
+| melewati `HandlerTimeout` | ctx handler dibatalkan; handler wajib menghormati ctx | – |
 
 Delivery bersifat **at-least-once**, jadi handler wajib idempotent (mis. cek `request_id` / `Message.ID` sebelum memproses).
 
@@ -103,6 +110,11 @@ Delivery bersifat **at-least-once**, jadi handler wajib idempotent (mis. cek `re
 | `span_id` Op pemanggil | `X-Span-ID` | `parent_span_id` dari Op `broker.consume` |
 
 Hasilnya, satu pencarian `trace_id` menampilkan request HTTP **dan** pemrosesan di worker. Atribut yang sudah diisi pemanggil tidak ditimpa. Setiap log di dalam handler otomatis membawa `trace_id`, `span_id`, `subscription`, `message_id`, `delivery_attempt`, `messaging_system`.
+
+Nilai `X-Request-ID` dan `X-Span-ID` divalidasi sebelum masuk context/log. Nilai tidak valid dibuang dan consumer membuat trace ID baru. Atribut reserved yang tidak valid saat publish juga diganti dari context yang valid tanpa mengubah `Message` milik caller.
+
+Nilai `OrderingKey` tidak dicatat karena sering berisi identifier bisnis. Log
+hanya membawa `has_ordering_key=true`.
 
 ```json
 {"level":"info","msg":"broker publish","trace_id":"a1…","layer":"client","messaging_system":"gcp_pubsub","topic":"webhook-dispatch","payload_bytes":214,"duration_ms":18.3,"message_id":"1234"}
@@ -122,6 +134,21 @@ Hasilnya, satu pencarian `trace_id` menampilkan request HTTP **dan** pemrosesan 
 | `Middleware` | – | Membungkus setiap handler; `[0]` paling luar. Berjalan di dalam tracing & panic recovery. |
 | `DisableLogging` | false | Matikan log milik broker (publish, consume, Op). |
 | `DisablePropagation` | false | Jangan tulis/baca atribut `X-Request-ID` / `X-Span-ID`. |
+| `LogPanicStack` | false | Sertakan stack trace untuk panic. Panic value tetap tidak pernah dicatat. |
+
+### Graceful shutdown
+
+`HandlerTimeout` membatalkan context, tetapi Go tidak dapat menghentikan handler yang mengabaikan cancellation. Gunakan deadline shutdown:
+
+```go
+shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+if err := b.CloseContext(shutdownCtx); err != nil {
+    logger.L().Warn("broker shutdown is still running", zap.Error(err))
+}
+```
+
+Jika deadline habis, `CloseContext` mengembalikan error sementara cleanup tetap berjalan di background. Panggilan `Close` berikutnya menunggu cleanup yang sama; driver tidak ditutup dua kali.
 
 ### `gcppubsub.Config`
 

@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -95,6 +97,9 @@ func TestWaitReadyGivesUp(t *testing.T) {
 	if logs.FilterMessage("database unreachable").FilterLevelExact(zapcore.ErrorLevel).Len() != 1 {
 		t.Error("missing unreachable error line")
 	}
+	if strings.Contains(fmt.Sprint(logs.All()), "connection refused") {
+		t.Fatalf("raw driver error leaked to startup logs: %v", logs.All())
+	}
 }
 
 func TestWaitReadyStopsOnContextCancel(t *testing.T) {
@@ -125,6 +130,26 @@ func TestWaitReadyPingTimeout(t *testing.T) {
 	}
 	if deadline <= 0 || deadline > time.Second {
 		t.Fatalf("ping deadline = %v, want ≤ 1s", deadline)
+	}
+}
+
+func TestWaitReadyRejectsNilPingAndSaturatesBackoff(t *testing.T) {
+	observe(t)
+	if err := WaitReady(context.Background(), Retry{}, nil); err == nil {
+		t.Fatal("nil ping should fail")
+	}
+	waits := noSleep(t)
+	ping, _ := flakyPing(2)
+	maxDuration := time.Duration(1<<63 - 1)
+	if err := WaitReady(context.Background(), Retry{
+		Attempts: 3, InitialBackoff: maxDuration/2 + 1, MaxBackoff: maxDuration,
+	}, ping); err != nil {
+		t.Fatal(err)
+	}
+	for _, wait := range *waits {
+		if wait <= 0 || wait > maxDuration {
+			t.Fatalf("overflowed backoff: %v", *waits)
+		}
 	}
 }
 
@@ -180,5 +205,117 @@ func TestHealthHandlerTimeout(t *testing.T) {
 	HealthHandler(50*time.Millisecond, hang).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
 	if rec.Code != 503 || time.Since(start) > time.Second {
 		t.Fatalf("status=%d after %v", rec.Code, time.Since(start))
+	}
+}
+
+func TestHealthHandlerLogsOnlyStateTransitions(t *testing.T) {
+	logs := observe(t)
+	var failing atomic.Bool
+	failing.Store(true)
+	handler := HealthHandler(time.Second, Check{Name: "primary", Ping: func(context.Context) error {
+		if failing.Load() {
+			return errors.New("dial secret-db.internal:5432")
+		}
+		return nil
+	}})
+
+	probe := func() int {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+		return rec.Code
+	}
+	firstStatus, secondStatus := probe(), probe()
+	if firstStatus != http.StatusServiceUnavailable || secondStatus != http.StatusServiceUnavailable {
+		t.Fatal("repeated failing probes must stay unavailable")
+	}
+	if got := logs.FilterMessage("health check failed").Len(); got != 1 {
+		t.Fatalf("repeated failure logs=%d, want one transition", got)
+	}
+	if strings.Contains(fmt.Sprint(logs.All()), "secret-db") {
+		t.Fatalf("raw health error leaked: %v", logs.All())
+	}
+
+	failing.Store(false)
+	if probe() != http.StatusOK || logs.FilterMessage("health check recovered").Len() != 1 {
+		t.Fatalf("recovery transition missing: %v", logs.All())
+	}
+	failing.Store(true)
+	if probe() != http.StatusServiceUnavailable || logs.FilterMessage("health check failed").Len() != 2 {
+		t.Fatalf("new failure transition missing: %v", logs.All())
+	}
+}
+
+func TestHealthHandlerSurvivesPanicAndNonCooperativeCheck(t *testing.T) {
+	logs := observe(t)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	started := make(chan struct{})
+	var stuckCalls atomic.Int32
+	checks := []Check{
+		{Name: "panic", Ping: func(context.Context) error { panic("secret panic value") }},
+		{Name: "stuck", Ping: func(context.Context) error {
+			stuckCalls.Add(1)
+			select {
+			case <-started:
+			default:
+				close(started)
+			}
+			<-release
+			return nil
+		}},
+		{Name: "nil", Ping: nil},
+	}
+
+	handler := HealthHandler(25*time.Millisecond, checks...)
+	rec := httptest.NewRecorder()
+	start := time.Now()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusServiceUnavailable || time.Since(start) > time.Second {
+		t.Fatalf("status=%d after %v", rec.Code, time.Since(start))
+	}
+	<-started
+	// A second readiness request must time out without starting another call to
+	// the dependency while the first non-cooperative call is still blocked.
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("second status=%d", rec.Code)
+	}
+	if got := stuckCalls.Load(); got != 1 {
+		t.Fatalf("non-cooperative check calls=%d, want 1", got)
+	}
+	if strings.Contains(fmt.Sprint(logs.All()), "secret panic value") {
+		t.Fatalf("panic value leaked to logs: %v", logs.All())
+	}
+	if logs.FilterMessage("health check failed").Len() < 2 {
+		t.Fatalf("expected panic and nil checks to fail: %v", logs.All())
+	}
+	if logs.FilterMessage("health check timed out").Len() == 0 {
+		t.Fatalf("expected stuck check timeout: %v", logs.All())
+	}
+}
+
+func TestHealthHandlerInvalidNamesAndNilSQLCheck(t *testing.T) {
+	observe(t)
+	handler := HealthHandler(time.Second,
+		Check{Name: "", Ping: func(context.Context) error { return nil }},
+		Check{Name: "db_4", Ping: func(context.Context) error { return nil }},
+		Check{Name: "db", Ping: func(context.Context) error { return nil }},
+		Check{Name: "db", Ping: func(context.Context) error { return nil }},
+		SQLCheck("sql", nil),
+	)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var got HealthResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"check_1", "db_4", "db", "db_5", "sql"} {
+		if _, ok := got.Checks[name]; !ok {
+			t.Errorf("missing normalized check %q: %+v", name, got.Checks)
+		}
 	}
 }

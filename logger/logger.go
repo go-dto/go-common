@@ -23,6 +23,11 @@ const (
 	KeyVersion    = "version"
 	KeyError      = "error"
 	KeyDurationMs = "duration_ms"
+	KeyMethod     = "method"
+	KeyPath       = "path"
+	KeyRoute      = "route"
+	KeyStatusCode = "status_code"
+	KeyRespBytes  = "response_bytes"
 
 	// Cross-layer tracing keys.
 	KeyLayer         = "layer"           // handler | service | repository | client | worker

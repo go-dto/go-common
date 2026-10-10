@@ -299,7 +299,7 @@ func TestDefaultsApplied(t *testing.T) {
 	}
 	tr := newBaseTransport(Options{}.withDefaults())
 	if tr.MaxIdleConnsPerHost != DefaultMaxIdleConnsPerHost || tr.TLSHandshakeTimeout != DefaultTLSHandshakeTimeout ||
-		tr.ResponseHeaderTimeout != DefaultResponseHeaderTimeout {
+		tr.ResponseHeaderTimeout != DefaultResponseHeaderTimeout || tr.MaxConnsPerHost != DefaultMaxConnsPerHost {
 		t.Errorf("base transport not tuned: %+v", tr)
 	}
 	if tr.Proxy == nil {
@@ -504,6 +504,19 @@ func TestRetryAfterOverflow(t *testing.T) {
 	// A huge value must be treated as "too long", not overflow into an immediate retry.
 	if resp.StatusCode != 429 || calls.Load() != 1 || len(*waits) != 0 {
 		t.Fatalf("status=%d calls=%d waits=%v", resp.StatusCode, calls.Load(), *waits)
+	}
+}
+
+func TestBackoffSaturatesWithoutOverflow(t *testing.T) {
+	maxDuration := time.Duration(1<<63 - 1)
+	transport := newRetryTransport(http.DefaultTransport, Config{
+		InitialBackoff: maxDuration/2 + 1,
+		MaxBackoff:     maxDuration,
+	})
+	for _, attempt := range []int{1, 2, 10} {
+		if got := transport.backoff(attempt); got <= 0 || got > maxDuration {
+			t.Fatalf("attempt %d backoff=%v", attempt, got)
+		}
 	}
 }
 

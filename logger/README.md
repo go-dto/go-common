@@ -2,7 +2,7 @@
 
 Package: `github.com/go-dto/go-common/logger`
 Basis: [`go.uber.org/zap`](https://github.com/uber-go/zap) v1.28
-Dependency tambahan: tidak ada (hanya `go.uber.org/multierr`, dependency bawaan zap). Sub-package `mongolog` memakai `go.mongodb.org/mongo-driver` (hanya ikut ter-compile jika `mongolog` di-import).
+Dependency tambahan: `github.com/felixge/httpsnoop` untuk menjaga interface `http.ResponseWriter` saat merekam access metrics. Sub-package `mongolog` memakai `go.mongodb.org/mongo-driver` (hanya ikut ter-compile jika `mongolog` di-import).
 
 ---
 
@@ -24,6 +24,7 @@ Dependency tambahan: tidak ada (hanya `go.uber.org/multierr`, dependency bawaan 
 14. [Best Practice](#14-best-practice)
 15. [Troubleshooting](#15-troubleshooting)
 16. [Tracing Lintas Layer](#16-tracing-lintas-layer)
+17. [Contoh Implementasi Production](#17-contoh-implementasi-production)
 
 ---
 
@@ -44,6 +45,7 @@ Dependency tambahan: tidak ada (hanya `go.uber.org/multierr`, dependency bawaan 
 | Level runtime | `SetLevel` atau endpoint HTTP `LevelHandler` |
 | Redirect stdlib `log` | `log.Printf` ikut jadi JSON terstruktur |
 | Tracing lintas layer | `StartOp` per function (handler → service → repository → client) dengan `span_id`, `parent_span_id`, `layer`, `op`, `duration_ms`; error dicatat sekali |
+| HTTP inbound | Middleware request-ID tervalidasi + access log status, durasi, ukuran response, dan panic |
 | HTTP outbound | `WrapHTTPClient` meneruskan `X-Request-ID` ke third party + log setiap hit |
 | MongoDB | `mongolog.NewMonitor` log setiap command dengan `trace_id` dari ctx |
 | Backward compatible | Package `singleton` lama tetap jalan |
@@ -62,6 +64,7 @@ logger/
 ├── redact.go               # Redactor + helper field (SafeURL, SafeJSON, ...)
 ├── rotate.go               # RotatingFile (WriteSyncer + rotasi)
 ├── op.go                   # StartOp / Op (tracing per function), MarkErrorLogged
+├── middleware.go           # HTTP inbound request-ID + access log
 ├── httpclient.go           # WrapHTTPClient, NewHTTPTransport, InjectHeaders
 ├── README.md
 ├── logger_test.go
@@ -81,8 +84,8 @@ Alur sebuah log dari request HTTP:
 
 ```mermaid
 flowchart LR
-    A[HTTP Request<br/>X-Request-ID] --> B[echo middleware.RequestID]
-    B --> C[rest.RequestIDContext<br/>ctxid.WithContext]
+    A[HTTP Request<br/>X-Request-ID] --> B[logger.HTTPMiddleware]
+    B --> C[validated trace_id<br/>access log]
     C --> D[Handler<br/>WithFields + StartOp]
     D --> E[Service<br/>StartOp]
     E --> R[Repository<br/>StartOp + mongolog]
@@ -108,11 +111,27 @@ if err != nil {
 if logCfg.ServiceName == "" {
     logCfg.ServiceName = "my-service"
 }
+if logCfg.Environment == "production" {
+    if err := logCfg.ValidateProduction(); err != nil {
+        log.Fatalf("unsafe production logger config: %v", err)
+    }
+}
 logger.MustInit(logCfg)
 defer func() { _ = logger.Close() }() // flush + tutup file
 ```
 
 Jika konfigurasi berasal dari sumber lain, gunakan `logger.ConfigFromLookup()` dengan fungsi lookup milik aplikasi.
+
+Untuk HTTP server berbasis `net/http`, pasang middleware di dalam recovery middleware aplikasi:
+
+```go
+handler := logger.HTTPMiddleware(logger.HTTPMiddlewareOptions{
+    Route: func(r *http.Request) string { return routeTemplate(r) },
+})(mux)
+```
+
+Jika callback `Route` tidak menghasilkan template, raw path dihilangkan secara
+default. `LogRawPath` hanya untuk endpoint yang dipastikan tidak memuat identifier.
 
 ### 3.2 Logging di handler / service / repository
 
@@ -414,7 +433,7 @@ defer op.Done(&err)
 
 ### 8.1 Key yang disensor default
 
-`password`, `passwd`, `pwd`, `secret`, `client_secret`, `token`, `access_token`, `refresh_token`, `id_token`, `authorization`, `auth`, `api_key`, `apikey`, `private_key`, `privatekey`, `sender_private_key`, `cookie`, `set_cookie`, `session`, `pin`, `otp`, `cvv`, `cvc`, `card_number`, `pan`.
+`password`, varian password, `secret`, `client_secret`, token, authorization, API/private key, cookie/session, PIN/OTP, dan data kartu. Header umum seperti `X-API-Key`, `X-Auth-Token`, `Proxy-Authorization`, `X-Amz-Security-Token`, dan `X-Goog-Api-Key` juga disensor.
 
 Pencocokan **case-insensitive** dan mengabaikan `_` / `-`: `apiKey`, `API-KEY`, `api_key` dianggap sama.
 
@@ -435,6 +454,7 @@ r := logger.NewRedactor("nik", "npwp", "phone_number")
 | `r.Headers(h)` | `Authorization: Bearer x` | `Authorization: [REDACTED]` |
 
 JSON yang tidak valid **tidak** dikembalikan mentah: hasilnya `[UNPARSEABLE JSON OMITTED]`.
+Input JSON/form di atas 1 MiB ditolak sebelum parsing agar logging tidak menambah alokasi tanpa batas. Gunakan `NewRedactorWithLimit` hanya jika aplikasi sudah membatasi input melalui mekanisme lain.
 
 ### 8.4 Helper field
 
@@ -474,6 +494,7 @@ Penamaan backup:
 ```
 log/webhook.log                              ← file aktif
 log/webhook-2026-10-05T23-59-59.812.log      ← backup (waktu rotasi)
+log/webhook-2026-10-05T23-59-59.812-001.log  ← suffix jika timestamp bertabrakan
 log/webhook-2026-10-04T23-59-58.201.log
 ```
 
@@ -484,8 +505,9 @@ Jaminan:
 - Satu entry log tidak pernah terpecah ke dua file.
 - Jika rotasi gagal, log tetap ditulis ke file lama (error ditulis ke stderr).
 - Folder dibuat otomatis (`0755`), file baru dibuat owner-only (`0600`).
+- Nama backup tidak saling menimpa jika dua rotasi terjadi pada milidetik yang sama.
 
-> Di container/Kubernetes, gunakan `stdout` saja dan biarkan platform yang mengumpulkan log.
+> Di container/Kubernetes, gunakan `stdout` saja dan biarkan platform yang mengumpulkan log. `RotatingFile` ditujukan untuk satu proses; jangan arahkan beberapa proses ke file aktif yang sama.
 
 ---
 
@@ -535,6 +557,7 @@ Perubahan berlaku seketika untuk semua goroutine, tanpa restart. Level kembali k
 | `ConfigFromEnv() (Config, error)` | Default + override dari OS env |
 | `ConfigFromLookup(fn) (Config, error)` | Sama, dengan sumber custom (mis. `configs.Lookup`) |
 | `(Config) Validate() error` | Validasi tanpa membuka file |
+| `(Config) ValidateProduction() error` | Tambahan validasi `service`, `env`, dan format JSON untuk production |
 | `New(cfg) (*Instance, error)` | Buat logger tanpa menyentuh global |
 | `Init(cfg) error` | Pasang logger global; boleh dipanggil ulang |
 | `MustInit(cfg)` | `Init`, panic jika error |
@@ -546,7 +569,7 @@ Perubahan berlaku seketika untuk semua goroutine, tanpa restart. Level kembali k
 | `SetLevel(s) error` / `GetLevel()` | Ubah / baca level |
 | `Enabled(lvl) bool` | Cek level sebelum membangun field mahal |
 | `LevelHandler() http.Handler` | Endpoint GET/PUT level |
-| `AddHook(fn...)` | Callback per entry (mis. metrics per level); harus cepat & tidak boleh log. Panggil **setelah** `Init` — hook hilang jika `Init` dipanggil ulang |
+| `AddHook(fn...)` | Callback per entry (mis. metrics per level); berlaku juga untuk `zap.L`, stdlib log, dan dipertahankan saat `Init` ulang; harus cepat & tidak boleh log |
 | `ReplaceForTest(l) func()` | Ganti global untuk test (level debug); kembalikan fungsi restore |
 
 ### 11.2 `Instance`
@@ -568,6 +591,7 @@ Perubahan berlaku seketika untuk semua goroutine, tanpa restart. Level kembali k
 | `SugarFromContext(ctx)` | Versi sugared |
 | `ctxid.WithContext(ctx, id)` / `ctxid.FromContext(ctx)` | Simpan / baca X-Request-ID; `FromContext` mengembalikan `ok=false` jika ID kosong |
 | `ctxid.New()` / `ctxid.Ensure(ctx)` | Buat ID baru (32 hex) / pastikan ctx punya ID |
+| `ctxid.Valid(id)` / `ctxid.MaxLength` | Validasi request-ID eksternal / batas default 128 byte |
 | `ctxid.Header` | `"X-Request-ID"` |
 
 ### 11.4 Redaksi
@@ -575,6 +599,7 @@ Perubahan berlaku seketika untuk semua goroutine, tanpa restart. Level kembali k
 | Fungsi | Deskripsi |
 |---|---|
 | `NewRedactor(extra...) *Redactor` | Default keys + key tambahan |
+| `NewRedactorWithLimit(max, extra...)` | Redactor dengan batas input custom |
 | `DefaultRedactor() *Redactor` | Redactor bersama (default keys) |
 | `(*Redactor) IsSensitive / JSON / Form / Body / URL / Headers` | Lihat [§8](#8-redaksi-data-sensitif) |
 | `Redacted(key)` / `SafeURL(key, url)` / `SafeJSON(key, b, max)` / `Truncated(key, s, max)` | Helper `zap.Field` |
@@ -604,9 +629,16 @@ Perubahan berlaku seketika untuk semua goroutine, tanpa restart. Level kembali k
 | `WrapHTTPClient(c, HTTPClientOptions) *http.Client` | Salinan `c` dengan transport yang log + propagasi `X-Request-ID` |
 | `NewHTTPTransport(base, HTTPClientOptions) http.RoundTripper` | Transport-nya saja |
 | `InjectHeaders(ctx, http.Header)` | Set `X-Request-ID` manual (untuk client yang tidak bisa di-wrap) |
-| `HTTPClientOptions{Peer, DisablePropagation, LogHeaders, Redactor}` | Opsi |
+| `HTTPClientOptions{Peer, Route, LogURL, DisablePropagation, LogHeaders, Redactor, SuccessLevel, DisableSuccessLog, SlowThreshold, StatusLevel}` | Opsi route aman, opt-in URL, level, volume, propagasi, dan redaksi |
 
-### 11.8 MongoDB (`mongolog`)
+### 11.8 HTTP inbound (`middleware.go`)
+
+| Fungsi | Deskripsi |
+|---|---|
+| `HTTPMiddleware(options)(next)` | Validasi/generate request-ID, pasang ke context dan response, lalu log method, route, status, bytes, dan durasi |
+| `HTTPMiddlewareOptions` | Route template callback, explicit `LogRawPath`, skip, slow threshold, level, dan suppress success log |
+
+### 11.9 MongoDB (`mongolog`)
 
 | Fungsi | Deskripsi |
 |---|---|
@@ -646,7 +678,7 @@ func TestSomething(t *testing.T) {
 go test -race ./logger/...
 ```
 
-Cakupan test: parsing & validasi env (termasuk `LOG_FUNCTION`, `LOG_SLOW_OP_MS`), bentuk output JSON, field `func`, `trace_id` + override field context, level runtime & HTTP handler, re-init + redirect stdlib, akses konkuren (`-race`), redaksi JSON/form/URL/header/truncate, rotasi per ukuran, rotasi harian + max age, `StartOp` (field, `caller`, `span_id` unik per pemanggilan, `parent_span_id`, error dicatat sekali, op slow), HTTP outbound (propagasi `X-Request-ID`, request asli tidak diubah, level per status, error transport), `ctxid.Ensure`, `mongolog` (field, isi dokumen tidak bocor, command diabaikan), dan shim `singleton` (termasuk `caller` yang benar).
+Cakupan test: validasi env/programatik/production, bentuk output JSON, context, runtime level, re-init termasuk long-running op, hook `logger`/zap/stdlib, akses konkuren (`-race`), batas dan variasi redaction, rotasi termasuk benturan nama, HTTP inbound, HTTP outbound termasuk kontrol volume/timeout, MongoDB, dan shim `singleton`.
 
 Contoh assert `span_id` di test:
 
@@ -729,11 +761,12 @@ Langkah migrasi bertahap yang disarankan:
 
 - Sensor URL dan body: `logger.SafeURL`, `DefaultRedactor().Body(...)`.
 - Cek `logger.Enabled(zapcore.DebugLevel)` sebelum membangun field mahal.
-- Pasang `AddHook` setelah `Init`.
+- Pasang `AddHook` sekali; hook dipertahankan ketika `Init` dipanggil ulang.
 - Satu `StartOp` per function publik di tiap layer, dan teruskan `ctx` hasil `StartOp` ke pemanggilan berikutnya.
 - Nama `op` konsisten `<komponen>.<Method>` (mis. `webhook_config.GetByReference`) supaya mudah diagregasi.
 - Cari pasangan `op started` ↔ `op finished` dengan `span_id`, bukan `trace_id + op`.
 - Buat request HTTP dengan `http.NewRequestWithContext(ctx, …)` supaya transport melihat `trace_id`.
+- Untuk client ber-volume tinggi, gunakan `DisableSuccessLog: true` atau turunkan `SuccessLevel` ke `debug`; slow/error tetap dicatat.
 
 **Hindari**
 
@@ -757,7 +790,7 @@ Langkah migrasi bertahap yang disarankan:
 | `write error: logger: write to closed file` di stderr | Logger lama dipakai > 5 detik setelah `Init` ulang | Jangan simpan `*zap.Logger` di struct; panggil `L()`/`FromContext` saat log |
 | Log terakhir hilang saat shutdown | `Close()` tidak terpanggil (mis. `os.Exit` / `log.Fatal`) | Hindari `Fatal` setelah init; kembalikan error ke `main` |
 | File log tidak berotasi | Ukuran belum terlewati / `RotateDaily=false` | Cek `LOG_FILE_MAX_SIZE_MB`, set `LOG_FILE_ROTATE_DAILY=true` |
-| Hook metrics tidak terpanggil | `AddHook` dipanggil sebelum `Init` / `Init` dipanggil ulang | Panggil `AddHook` setelah `Init` terakhir |
+| Hook metrics tidak terpanggil | Hook lambat/error atau proses memakai logger lain yang tidak terhubung | Pastikan penulisan lewat `logger`, `zap.L`, atau stdlib log yang sudah di-init |
 | Third party tidak menerima `X-Request-ID` | Client tidak di-wrap / request tanpa ctx | Pakai `WrapHTTPClient` dan `http.NewRequestWithContext(ctx, …)` |
 | Log repository tidak punya `layer`/`op` | Lupa `StartOp` atau ctx lama yang diteruskan | Teruskan ctx **hasil** `StartOp` |
 | Error yang sama muncul berkali-kali | Di-log manual di tiap layer | Biarkan `op.Done(&err)`; untuk log manual pakai `MarkErrorLogged` |
@@ -773,12 +806,13 @@ Tujuan: satu request bisa diikuti dari handler → service → repository (MySQL
 | Komponen | Yang dilakukan |
 |---|---|
 | `trace_id` | Dari `X-Request-ID` (middleware). Diteruskan otomatis lewat ctx dan **dikirim ke third party** oleh `WrapHTTPClient` |
+| HTTP inbound | `HTTPMiddleware` memvalidasi request-ID dan mencatat `method`, route template, `status_code`, `response_bytes`, `duration_ms`; raw path default-nya dihilangkan |
 | `request_id`, `org_id`, … | Dipasang sekali dengan `WithFields` di handler, ikut ke semua layer |
 | `StartOp` | Menandai function: menambah `span_id`, `parent_span_id`, `layer`, `op` ke ctx, mencatat `op started` / `op finished` (debug) dengan `duration_ms` |
 | Error sekali | `op failed` level `error` hanya dicatat oleh layer **terdalam** yang mengalami error; layer luar dengan error yang sama (atau yang membungkusnya dengan `%w`) dicatat `debug` + `error_logged=true` |
 | Slow | Op / HTTP yang ≥ `LOG_SLOW_OP_MS` dicatat `warn` (`op slow`) — terlihat di production tanpa debug |
-| HTTP outbound | Satu baris per hit: `method`, `url` (disensor), `host`, `peer`, `status_code`, `duration_ms` |
-| MongoDB | Satu baris per command: `db_command`, `db_collection`, `duration_ms` (isi dokumen tidak pernah di-log) |
+| HTTP outbound | Satu baris per hit: `method`, route template, `host`, `peer`, `status_code`, `duration_ms`; URL hanya melalui explicit `LogURL` |
+| MongoDB | Satu baris per command: `db_command`, `db_collection`, `duration_ms` (isi dokumen dan raw failure tidak pernah di-log) |
 | Worker | `ctxid.Ensure` membuat `trace_id` baru; `origin_trace_id` + `request_id` menyambungkan ke request asal |
 
 ```mermaid
@@ -802,7 +836,10 @@ clientOpts := options.Client().
 
 // webhookutil/sender.go — HTTP client yang log + teruskan X-Request-ID
 var httpClient = logger.WrapHTTPClient(&http.Client{Timeout: 15 * time.Second},
-    logger.HTTPClientOptions{Peer: "client_webhook"})
+    logger.HTTPClientOptions{
+        Peer: "client_webhook",
+        Route: func(*http.Request) string { return "/hook" },
+    })
 ```
 
 ### 16.3 Implementasi per layer
@@ -934,11 +971,11 @@ handler   WebhookHandler.SendEncryptedPayload   span 1227d54e…                
 Skenario: third party membalas `502` → retry dijadwalkan → worker mengirim ulang dan sukses. Hanya baris penting yang muncul:
 
 ```json
-{"level":"warn","time":"2026-10-06T22:06:20.894016271+07:00","msg":"http outbound error status","service":"webhook","env":"production","version":"1.4.0","trace_id":"f3a91c0e9b2d4c7a8e1f00b2c3d4e5f6","request_id":"6702a1f0c9e77b0012ab34cd","org_id":"org-001","client_id":"client-abc","span_id":"8a664aeea267ab7c","parent_span_id":"6b92a517a404646c","layer":"client","op":"webhookutil.SendCombinedCipherText","method":"POST","url":"http://127.0.0.1:35055/hook?token=%5BREDACTED%5D","host":"127.0.0.1:35055","duration_ms":0.377409,"peer":"client_webhook","status_code":502}
+{"level":"warn","time":"2026-10-06T22:06:20.894016271+07:00","msg":"http outbound error status","service":"webhook","env":"production","version":"1.4.0","trace_id":"f3a91c0e9b2d4c7a8e1f00b2c3d4e5f6","request_id":"6702a1f0c9e77b0012ab34cd","org_id":"org-001","client_id":"client-abc","span_id":"8a664aeea267ab7c","parent_span_id":"6b92a517a404646c","layer":"client","op":"webhookutil.SendCombinedCipherText","method":"POST","route":"/hook","host":"127.0.0.1:35055","duration_ms":0.377409,"peer":"client_webhook","status_code":502}
 {"level":"error","time":"2026-10-06T22:06:20.894093035+07:00","caller":"demo/main.go:74","msg":"op failed","service":"webhook","env":"production","version":"1.4.0","trace_id":"f3a91c0e9b2d4c7a8e1f00b2c3d4e5f6","request_id":"6702a1f0c9e77b0012ab34cd","org_id":"org-001","client_id":"client-abc","span_id":"8a664aeea267ab7c","parent_span_id":"6b92a517a404646c","layer":"client","op":"webhookutil.SendCombinedCipherText","duration_ms":0.634524,"error":"webhook returned status 502"}
 {"level":"warn","time":"2026-10-06T22:06:20.894117508+07:00","caller":"demo/main.go:90","msg":"webhook send failed, scheduling retry","service":"webhook","env":"production","version":"1.4.0","trace_id":"f3a91c0e9b2d4c7a8e1f00b2c3d4e5f6","request_id":"6702a1f0c9e77b0012ab34cd","org_id":"org-001","client_id":"client-abc","span_id":"6b92a517a404646c","parent_span_id":"8d5d3109a8295ad2","layer":"service","op":"webhook.SendEncryptedPayload","error":"webhook returned status 502"}
 {"level":"info","time":"2026-10-06T22:06:20.896357382+07:00","caller":"demo/main.go:109","msg":"webhook payload processed","service":"webhook","env":"production","version":"1.4.0","trace_id":"f3a91c0e9b2d4c7a8e1f00b2c3d4e5f6","request_id":"6702a1f0c9e77b0012ab34cd","org_id":"org-001","client_id":"client-abc","span_id":"8d5d3109a8295ad2","layer":"handler","op":"WebhookHandler.SendEncryptedPayload","status_code":202}
-{"level":"info","time":"2026-10-06T22:06:20.8967714+07:00","msg":"http outbound","service":"webhook","env":"production","version":"1.4.0","trace_id":"60e0e90f6ab3cbfde000ab86c9cb7979","origin_trace_id":"f3a91c0e9b2d4c7a8e1f00b2c3d4e5f6","request_id":"6702a1f0c9e77b0012ab34cd","org_id":"org-001","attempt":2,"span_id":"8030b8c16b225c0b","parent_span_id":"59f6a577e8f5799a","layer":"client","op":"webhookutil.SendCombinedCipherText","method":"POST","url":"http://127.0.0.1:35055/hook?token=%5BREDACTED%5D","host":"127.0.0.1:35055","duration_ms":0.253615,"peer":"client_webhook","status_code":200}
+{"level":"info","time":"2026-10-06T22:06:20.8967714+07:00","msg":"http outbound","service":"webhook","env":"production","version":"1.4.0","trace_id":"60e0e90f6ab3cbfde000ab86c9cb7979","origin_trace_id":"f3a91c0e9b2d4c7a8e1f00b2c3d4e5f6","request_id":"6702a1f0c9e77b0012ab34cd","org_id":"org-001","attempt":2,"span_id":"8030b8c16b225c0b","parent_span_id":"59f6a577e8f5799a","layer":"client","op":"webhookutil.SendCombinedCipherText","method":"POST","route":"/hook","host":"127.0.0.1:35055","duration_ms":0.253615,"peer":"client_webhook","status_code":200}
 {"level":"info","time":"2026-10-06T22:06:20.896790817+07:00","caller":"demo/main.go:123","msg":"webhook retry attempt finished","service":"webhook","env":"production","version":"1.4.0","trace_id":"60e0e90f6ab3cbfde000ab86c9cb7979","origin_trace_id":"f3a91c0e9b2d4c7a8e1f00b2c3d4e5f6","request_id":"6702a1f0c9e77b0012ab34cd","org_id":"org-001","attempt":2,"span_id":"59f6a577e8f5799a","layer":"worker","op":"webhook.processRetryJob","status_code":200}
 ```
 
@@ -956,7 +993,7 @@ Setiap function tercatat masuk/keluar beserta durasinya:
 {"level":"debug","time":"2026-10-06T22:06:20.880151315+07:00","msg":"mongo command","service":"webhook","env":"production","version":"1.4.0","trace_id":"f3a91c0e9b2d4c7a8e1f00b2c3d4e5f6","request_id":"6702a1f0c9e77b0012ab34cd","org_id":"org-001","client_id":"client-abc","span_id":"aa657b55122d2817","parent_span_id":"69fe58080655a93f","layer":"repository","op":"webhook_send.Insert","db_system":"mongodb","db_command":"insert","db_name":"webhook","duration_ms":3,"db_collection":"webhook_sends"}
 {"level":"debug","time":"2026-10-06T22:06:20.88018227+07:00","caller":"demo/main.go:51","msg":"op finished","service":"webhook","env":"production","version":"1.4.0","trace_id":"f3a91c0e9b2d4c7a8e1f00b2c3d4e5f6","request_id":"6702a1f0c9e77b0012ab34cd","org_id":"org-001","client_id":"client-abc","span_id":"aa657b55122d2817","parent_span_id":"69fe58080655a93f","layer":"repository","op":"webhook_send.Insert","duration_ms":3.328094}
 {"level":"debug","time":"2026-10-06T22:06:20.88020306+07:00","caller":"demo/main.go:65","msg":"op started","service":"webhook","env":"production","version":"1.4.0","trace_id":"f3a91c0e9b2d4c7a8e1f00b2c3d4e5f6","request_id":"6702a1f0c9e77b0012ab34cd","org_id":"org-001","client_id":"client-abc","span_id":"4898ca7f901c1229","parent_span_id":"69fe58080655a93f","layer":"client","op":"webhookutil.SendCombinedCipherText"}
-{"level":"warn","time":"2026-10-06T22:06:20.88079587+07:00","msg":"http outbound error status","service":"webhook","env":"production","version":"1.4.0","trace_id":"f3a91c0e9b2d4c7a8e1f00b2c3d4e5f6","request_id":"6702a1f0c9e77b0012ab34cd","org_id":"org-001","client_id":"client-abc","span_id":"4898ca7f901c1229","parent_span_id":"69fe58080655a93f","layer":"client","op":"webhookutil.SendCombinedCipherText","method":"POST","url":"http://127.0.0.1:41171/hook?token=%5BREDACTED%5D","host":"127.0.0.1:41171","duration_ms":0.497649,"peer":"client_webhook","status_code":502}
+{"level":"warn","time":"2026-10-06T22:06:20.88079587+07:00","msg":"http outbound error status","service":"webhook","env":"production","version":"1.4.0","trace_id":"f3a91c0e9b2d4c7a8e1f00b2c3d4e5f6","request_id":"6702a1f0c9e77b0012ab34cd","org_id":"org-001","client_id":"client-abc","span_id":"4898ca7f901c1229","parent_span_id":"69fe58080655a93f","layer":"client","op":"webhookutil.SendCombinedCipherText","method":"POST","route":"/hook","host":"127.0.0.1:41171","duration_ms":0.497649,"peer":"client_webhook","status_code":502}
 {"level":"error","time":"2026-10-06T22:06:20.880823599+07:00","caller":"demo/main.go:74","msg":"op failed","service":"webhook","env":"production","version":"1.4.0","trace_id":"f3a91c0e9b2d4c7a8e1f00b2c3d4e5f6","request_id":"6702a1f0c9e77b0012ab34cd","org_id":"org-001","client_id":"client-abc","span_id":"4898ca7f901c1229","parent_span_id":"69fe58080655a93f","layer":"client","op":"webhookutil.SendCombinedCipherText","duration_ms":0.620156,"error":"webhook returned status 502"}
 {"level":"warn","time":"2026-10-06T22:06:20.880842304+07:00","caller":"demo/main.go:90","msg":"webhook send failed, scheduling retry","service":"webhook","env":"production","version":"1.4.0","trace_id":"f3a91c0e9b2d4c7a8e1f00b2c3d4e5f6","request_id":"6702a1f0c9e77b0012ab34cd","org_id":"org-001","client_id":"client-abc","span_id":"69fe58080655a93f","parent_span_id":"1a5d484483397393","layer":"service","op":"webhook.SendEncryptedPayload","error":"webhook returned status 502"}
 {"level":"debug","time":"2026-10-06T22:06:20.880851449+07:00","caller":"demo/main.go:55","msg":"op started","service":"webhook","env":"production","version":"1.4.0","trace_id":"f3a91c0e9b2d4c7a8e1f00b2c3d4e5f6","request_id":"6702a1f0c9e77b0012ab34cd","org_id":"org-001","client_id":"client-abc","span_id":"d27532df4d238e85","parent_span_id":"69fe58080655a93f","layer":"repository","op":"webhook_retry_job.Insert"}
@@ -967,7 +1004,7 @@ Setiap function tercatat masuk/keluar beserta durasinya:
 {"level":"info","time":"2026-10-06T22:06:20.883128491+07:00","caller":"demo/main.go:109","msg":"webhook payload processed","service":"webhook","env":"production","version":"1.4.0","trace_id":"f3a91c0e9b2d4c7a8e1f00b2c3d4e5f6","request_id":"6702a1f0c9e77b0012ab34cd","org_id":"org-001","client_id":"client-abc","span_id":"1a5d484483397393","layer":"handler","op":"WebhookHandler.SendEncryptedPayload","status_code":202}
 {"level":"debug","time":"2026-10-06T22:06:20.88313912+07:00","caller":"demo/main.go:120","msg":"op started","service":"webhook","env":"production","version":"1.4.0","trace_id":"cf06e5bd1da351f1231cc7e92a05aee4","origin_trace_id":"f3a91c0e9b2d4c7a8e1f00b2c3d4e5f6","request_id":"6702a1f0c9e77b0012ab34cd","org_id":"org-001","attempt":2,"span_id":"396e023c1da2157d","layer":"worker","op":"webhook.processRetryJob"}
 {"level":"debug","time":"2026-10-06T22:06:20.883154528+07:00","caller":"demo/main.go:65","msg":"op started","service":"webhook","env":"production","version":"1.4.0","trace_id":"cf06e5bd1da351f1231cc7e92a05aee4","origin_trace_id":"f3a91c0e9b2d4c7a8e1f00b2c3d4e5f6","request_id":"6702a1f0c9e77b0012ab34cd","org_id":"org-001","attempt":2,"span_id":"bfc10976947bd189","parent_span_id":"396e023c1da2157d","layer":"client","op":"webhookutil.SendCombinedCipherText"}
-{"level":"info","time":"2026-10-06T22:06:20.883330121+07:00","msg":"http outbound","service":"webhook","env":"production","version":"1.4.0","trace_id":"cf06e5bd1da351f1231cc7e92a05aee4","origin_trace_id":"f3a91c0e9b2d4c7a8e1f00b2c3d4e5f6","request_id":"6702a1f0c9e77b0012ab34cd","org_id":"org-001","attempt":2,"span_id":"bfc10976947bd189","parent_span_id":"396e023c1da2157d","layer":"client","op":"webhookutil.SendCombinedCipherText","method":"POST","url":"http://127.0.0.1:41171/hook?token=%5BREDACTED%5D","host":"127.0.0.1:41171","duration_ms":0.116278,"peer":"client_webhook","status_code":200}
+{"level":"info","time":"2026-10-06T22:06:20.883330121+07:00","msg":"http outbound","service":"webhook","env":"production","version":"1.4.0","trace_id":"cf06e5bd1da351f1231cc7e92a05aee4","origin_trace_id":"f3a91c0e9b2d4c7a8e1f00b2c3d4e5f6","request_id":"6702a1f0c9e77b0012ab34cd","org_id":"org-001","attempt":2,"span_id":"bfc10976947bd189","parent_span_id":"396e023c1da2157d","layer":"client","op":"webhookutil.SendCombinedCipherText","method":"POST","route":"/hook","host":"127.0.0.1:41171","duration_ms":0.116278,"peer":"client_webhook","status_code":200}
 {"level":"debug","time":"2026-10-06T22:06:20.88334677+07:00","caller":"demo/main.go:76","msg":"op finished","service":"webhook","env":"production","version":"1.4.0","trace_id":"cf06e5bd1da351f1231cc7e92a05aee4","origin_trace_id":"f3a91c0e9b2d4c7a8e1f00b2c3d4e5f6","request_id":"6702a1f0c9e77b0012ab34cd","org_id":"org-001","attempt":2,"span_id":"bfc10976947bd189","parent_span_id":"396e023c1da2157d","layer":"client","op":"webhookutil.SendCombinedCipherText","duration_ms":0.192383}
 {"level":"debug","time":"2026-10-06T22:06:20.883353228+07:00","caller":"demo/main.go:122","msg":"op finished","service":"webhook","env":"production","version":"1.4.0","trace_id":"cf06e5bd1da351f1231cc7e92a05aee4","origin_trace_id":"f3a91c0e9b2d4c7a8e1f00b2c3d4e5f6","request_id":"6702a1f0c9e77b0012ab34cd","org_id":"org-001","attempt":2,"span_id":"396e023c1da2157d","layer":"worker","op":"webhook.processRetryJob","duration_ms":0.214438}
 {"level":"info","time":"2026-10-06T22:06:20.883358917+07:00","caller":"demo/main.go:123","msg":"webhook retry attempt finished","service":"webhook","env":"production","version":"1.4.0","trace_id":"cf06e5bd1da351f1231cc7e92a05aee4","origin_trace_id":"f3a91c0e9b2d4c7a8e1f00b2c3d4e5f6","request_id":"6702a1f0c9e77b0012ab34cd","org_id":"org-001","attempt":2,"span_id":"396e023c1da2157d","layer":"worker","op":"webhook.processRetryJob","status_code":200}
@@ -977,9 +1014,266 @@ Yang perlu diperhatikan:
 
 - `X-Request-ID` yang diterima third party = `trace_id` (`f3a91c0e…`); retry memakai `trace_id` baru dengan `origin_trace_id` ke request asal.
 - `op failed` level `error` hanya muncul **sekali**, di layer `client`. Layer `service` menangani error tersebut (warn + jadwalkan retry), sehingga `handler` selesai normal.
-- `url` sudah disensor (`token=%5BREDACTED%5D`), dan isi dokumen Mongo tidak ikut.
+- raw URL/path dihilangkan dan diganti route template; isi dokumen maupun raw failure Mongo tidak ikut.
 - Baris `http outbound` dan `mongo command` membawa `span_id` op pemanggilnya, jadi ikut muncul saat mencari by `span_id`.
 - Baris `http outbound` dan `mongo command` tidak punya `caller` (akan menunjuk ke internal `net/http` / driver); lokasi pemanggil dilihat dari field `op`.
 | Tidak bisa memasangkan `op started` dengan `op finished` | Mencari by `trace_id + op` (ambigu jika function dipanggil berulang) | Cari by `span_id` |
 | Ada `op started` tanpa `op finished` / `op failed` | Function hang / timeout / panic sebelum `defer` jalan | Cek `span_id` tersebut dan log sesudahnya; pastikan `defer op.Done(&err)` tepat setelah `StartOp` |
 | `parent_span_id` tidak muncul / salah | ctx yang diteruskan bukan hasil `StartOp` pemanggil | Teruskan ctx **hasil** `StartOp`, bukan ctx awal |
+
+---
+
+## 17. Contoh Implementasi Production
+
+Contoh berikut menunjukkan integrasi lengkap berbasis `net/http`:
+
+- konfigurasi production divalidasi sebelum server berjalan;
+- request ID eksternal dibatasi dan diteruskan melalui context;
+- access log memakai route template agar ID pada URL tidak menjadi field ber-cardinality tinggi;
+- panic dicatat oleh logger lalu ditangani recovery middleware;
+- keberhasilan HTTP outbound hanya muncul pada level `debug`, sedangkan slow call dan error tetap terlihat di production;
+- shutdown menunggu request aktif selesai dan logger ditutup secara eksplisit.
+
+### 17.1 `main.go`
+
+```go
+package main
+
+import (
+    "context"
+    "encoding/json"
+    "errors"
+    "fmt"
+    "log"
+    "net/http"
+    "net/url"
+    "os"
+    "os/signal"
+    "strings"
+    "syscall"
+    "time"
+
+    "go.uber.org/zap"
+    "go.uber.org/zap/zapcore"
+
+    "github.com/go-dto/go-common/logger"
+)
+
+type application struct {
+    callbackClient *http.Client
+    callbackURL    string
+}
+
+type callbackRequest struct {
+    Event string `json:"event"`
+}
+
+func main() {
+    cfg, err := logger.ConfigFromEnv()
+    if err != nil {
+        log.Fatalf("read logger config: %v", err)
+    }
+    if cfg.ServiceName == "" {
+        cfg.ServiceName = "callback-service"
+    }
+    callbackURL, err := validateOutboundURL(os.Getenv("PARTNER_CALLBACK_URL"))
+    if err != nil {
+        log.Fatalf("invalid PARTNER_CALLBACK_URL: %v", err)
+    }
+    if err := cfg.ValidateProduction(); err != nil {
+        log.Fatalf("unsafe production logger config: %v", err)
+    }
+    if err := logger.Init(cfg); err != nil {
+        log.Fatalf("initialize logger: %v", err)
+    }
+
+    // Sukses biasa hanya terlihat saat LOG_LEVEL=debug. Slow call, status >=400,
+    // dan transport error tetap dicatat pada level warn/error.
+    successLevel := zapcore.DebugLevel
+    app := &application{
+        callbackURL: callbackURL,
+        callbackClient: logger.WrapHTTPClient(
+            &http.Client{Timeout: 10 * time.Second},
+            logger.HTTPClientOptions{
+                Peer:          "partner_callback",
+                SuccessLevel:  &successLevel,
+                SlowThreshold: 2 * time.Second,
+                StatusLevel: func(status int) zapcore.Level {
+                    if status >= http.StatusInternalServerError {
+                        return zapcore.ErrorLevel
+                    }
+                    return zapcore.WarnLevel
+                },
+            },
+        ),
+    }
+
+    exitCode := 0
+    if err := app.serve(); err != nil {
+        logger.L().Error("server stopped", zap.Error(err))
+        exitCode = 1
+    }
+    if err := logger.Close(); err != nil {
+        // Logger sudah tidak boleh dipakai setelah Close; laporkan melalui stderr.
+        fmt.Fprintf(os.Stderr, "close logger: %v\n", err)
+        exitCode = 1
+    }
+    if exitCode != 0 {
+        os.Exit(exitCode)
+    }
+}
+
+func validateOutboundURL(raw string) (string, error) {
+    parsed, err := url.Parse(strings.TrimSpace(raw))
+    if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
+        return "", errors.New("must be an absolute HTTPS URL without user info or fragment")
+    }
+    return parsed.String(), nil
+}
+
+func (a *application) serve() error {
+    mux := http.NewServeMux()
+    mux.HandleFunc("POST /v1/callbacks", a.handleCallback)
+    mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
+        w.WriteHeader(http.StatusNoContent)
+    })
+
+    accessLog := logger.HTTPMiddleware(logger.HTTPMiddlewareOptions{
+        // Go 1.22+ mengisi Request.Pattern setelah ServeMux memilih handler.
+        // Middleware mengevaluasi callback ini setelah handler selesai.
+        Route: func(r *http.Request) string { return r.Pattern },
+        Skip:  func(r *http.Request) bool { return r.URL.Path == "/health" },
+        SlowThreshold: 1500 * time.Millisecond,
+    })(mux)
+
+    // Recovery harus berada di luar logger.HTTPMiddleware. Middleware logger
+    // mencatat panic tanpa nilainya, melempar ulang, lalu recovery mengubahnya
+    // menjadi response 500.
+    handler := recoveryMiddleware(accessLog)
+    server := &http.Server{
+        Addr:              ":8080",
+        Handler:           handler,
+        ReadHeaderTimeout: 5 * time.Second,
+        ReadTimeout:       15 * time.Second,
+        WriteTimeout:      15 * time.Second,
+        IdleTimeout:       60 * time.Second,
+    }
+
+    stopCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+    defer stop()
+
+    serverErr := make(chan error, 1)
+    go func() {
+        serverErr <- server.ListenAndServe()
+    }()
+
+    select {
+    case err := <-serverErr:
+        if errors.Is(err, http.ErrServerClosed) {
+            return nil
+        }
+        return fmt.Errorf("listen HTTP server: %w", err)
+    case <-stopCtx.Done():
+        shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+        defer cancel()
+        if err := server.Shutdown(shutdownCtx); err != nil {
+            return fmt.Errorf("shutdown HTTP server: %w", err)
+        }
+        return nil
+    }
+}
+
+func recoveryMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        defer func() {
+            if recover() != nil {
+                http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+            }
+        }()
+        next.ServeHTTP(w, r)
+    })
+}
+
+func (a *application) handleCallback(w http.ResponseWriter, r *http.Request) {
+    // Batasi request body di layer HTTP sebelum decode. Payload tidak di-log.
+    r.Body = http.MaxBytesReader(w, r.Body, 64<<10) // 64 KiB
+    var input callbackRequest
+    if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+        logger.FromContext(r.Context()).Warn("invalid callback request")
+        http.Error(w, "invalid request", http.StatusBadRequest)
+        return
+    }
+    if input.Event != "created" && input.Event != "updated" {
+        logger.FromContext(r.Context()).Warn("unsupported callback event")
+        http.Error(w, "unsupported event", http.StatusBadRequest)
+        return
+    }
+
+    ctx, op := logger.StartOp(r.Context(), logger.LayerHandler, "callback.Handle",
+        zap.String("event", input.Event),
+        logger.SafeURL("callback_url", a.callbackURL),
+    )
+    var opErr error
+    defer op.Done(&opErr)
+
+    status, err := a.sendCallback(ctx, a.callbackURL)
+    if err != nil {
+        opErr = err
+        http.Error(w, "callback failed", http.StatusBadGateway)
+        return
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(http.StatusAccepted)
+    _ = json.NewEncoder(w).Encode(map[string]any{
+        "status":          "accepted",
+        "upstream_status": status,
+    })
+}
+
+func (a *application) sendCallback(ctx context.Context, target string) (status int, err error) {
+    ctx, op := logger.StartOp(ctx, logger.LayerClient, "callback.Send")
+    defer op.Done(&err)
+
+    req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, nil)
+    if err != nil {
+        return 0, fmt.Errorf("build callback request: %w", err)
+    }
+    resp, err := a.callbackClient.Do(req)
+    if err != nil {
+        return 0, fmt.Errorf("send callback: %w", err)
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode >= http.StatusBadRequest {
+        return resp.StatusCode, fmt.Errorf("callback returned status %d", resp.StatusCode)
+    }
+    return resp.StatusCode, nil
+}
+```
+
+### 17.2 Environment production
+
+```env
+SERVICE_NAME=callback-service
+APP_ENV=production
+APP_VERSION=1.0.0
+LOG_LEVEL=info
+LOG_FORMAT=json
+LOG_OUTPUT=stdout
+LOG_CALLER=true
+LOG_STACKTRACE_LEVEL=panic
+LOG_REDIRECT_STDLOG=true
+LOG_SLOW_OP_MS=1000
+PARTNER_CALLBACK_URL=https://partner.example.com/v1/events
+```
+
+Jika endpoint menerima NIK, data medis, token, atau payload sensitif lain, jangan menambahkan body ke log. Tambahkan hanya metadata yang diperlukan melalui `WithFields`, dan daftarkan key aplikasi pada redactor bila memang harus mencatat JSON terbatas:
+
+```go
+redactor := logger.NewRedactorWithLimit(256<<10, "nik", "phone_number", "medical_record_number")
+safePayload := redactor.Body("application/json", body, 2<<10)
+logger.FromContext(ctx).Debug("validated metadata", zap.String("payload", safePayload))
+```
+
+Contoh terakhir hanya sesuai untuk payload yang sudah diklasifikasikan aman. Untuk payload medis atau plaintext kredensial, log metadata saja dan jangan panggil `Body`/`SafeJSON`.

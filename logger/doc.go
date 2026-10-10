@@ -9,11 +9,12 @@
 //   - Runtime level changes: SetLevel or the LevelHandler HTTP endpoint.
 //   - No sampling by default, so audit logs are never silently dropped.
 //   - Context propagation: trace_id from ctxid plus fields added with WithFields.
-//   - Redaction helpers for JSON/form bodies, URLs and headers.
+//   - Bounded redaction helpers for JSON/form bodies, URLs and headers.
 //   - Optional rotating file output (size / daily / max backups / max age), no extra deps.
 //   - Standard library "log" redirected into the structured logger.
 //   - Cross-layer tracing: StartOp/Op adds layer, op and duration_ms per
 //     function and reports each error at error level once.
+//   - Inbound HTTP: HTTPMiddleware validates request IDs and logs access metrics.
 //   - Outbound HTTP: WrapHTTPClient propagates X-Request-ID and logs every call.
 //   - MongoDB: mongolog.NewMonitor logs commands with the caller's context.
 //

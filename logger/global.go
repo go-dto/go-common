@@ -1,6 +1,7 @@
 package logger
 
 import (
+	"errors"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -11,9 +12,11 @@ import (
 )
 
 type globalState struct {
-	inst    *Instance
-	sugar   *zap.SugaredLogger
-	restore func() // undo zap.ReplaceGlobals / RedirectStdLog
+	inst           *Instance
+	sugar          *zap.SugaredLogger
+	restore        func() // undo zap.ReplaceGlobals / RedirectStdLog
+	redirectStdLog bool
+	hooks          []func(zapcore.Entry) error
 }
 
 // closeGracePeriod is how long a replaced logger stays open after re-Init.
@@ -49,24 +52,23 @@ func Init(cfg Config) error {
 	initMu.Lock()
 	defer initMu.Unlock()
 
-	// Undo the previous logger's hooks into zap/std log first, so the restore
-	// functions unwind in the right order and nothing points at a closed file.
+	// Preserve process-wide hooks across configuration reloads.
 	old := global.Load()
-	old.restore()
-
-	undoGlobals := zap.ReplaceGlobals(inst.Logger)
-	undoStd := func() {}
-	if cfg.RedirectStdLog {
-		undoStd = zap.RedirectStdLog(inst.Logger.Named("stdlog"))
+	hooks := append([]func(zapcore.Entry) error(nil), old.hooks...)
+	if len(hooks) > 0 {
+		inst.Logger = inst.Logger.WithOptions(zap.Hooks(hooks...))
 	}
 
+	// Undo the previous logger's hooks into zap/std log first, so the restore
+	// functions unwind in the right order and nothing points at a closed file.
+	old.restore()
+
 	global.Store(&globalState{
-		inst:  inst,
-		sugar: inst.Sugar(),
-		restore: func() {
-			undoStd()
-			undoGlobals()
-		},
+		inst:           inst,
+		sugar:          inst.Sugar(),
+		restore:        installProcessGlobals(inst.Logger, cfg.RedirectStdLog),
+		redirectStdLog: cfg.RedirectStdLog,
+		hooks:          hooks,
 	})
 	// Loggers obtained from the old instance just before the swap may still be
 	// writing; give them a grace period before closing its files.
@@ -130,12 +132,64 @@ func LevelHandler() http.Handler {
 // AddHook registers callbacks invoked for every written entry (e.g. metrics
 // counters per level). Hooks must be fast and must not log.
 func AddHook(hooks ...func(zapcore.Entry) error) {
+	if len(hooks) == 0 {
+		return
+	}
+	hooks = protectHooks(hooks)
+	if len(hooks) == 0 {
+		return
+	}
 	initMu.Lock()
 	defer initMu.Unlock()
 	cur := global.Load()
 	inst := *cur.inst
 	inst.Logger = inst.Logger.WithOptions(zap.Hooks(hooks...))
-	global.Store(&globalState{inst: &inst, sugar: inst.Sugar(), restore: cur.restore})
+	allHooks := append([]func(zapcore.Entry) error(nil), cur.hooks...)
+	allHooks = append(allHooks, hooks...)
+
+	// Keep logger.L/S, zap.L/S, and the redirected stdlib logger on the same
+	// instance. Otherwise hooks would silently miss entries written via zap.L.
+	cur.restore()
+	global.Store(&globalState{
+		inst:           &inst,
+		sugar:          inst.Sugar(),
+		restore:        installProcessGlobals(inst.Logger, cur.redirectStdLog),
+		redirectStdLog: cur.redirectStdLog,
+		hooks:          allHooks,
+	})
+}
+
+var errHookPanicked = errors.New("logger: hook panicked")
+
+func protectHooks(hooks []func(zapcore.Entry) error) []func(zapcore.Entry) error {
+	protected := make([]func(zapcore.Entry) error, 0, len(hooks))
+	for _, hook := range hooks {
+		if hook == nil {
+			continue
+		}
+		h := hook
+		protected = append(protected, func(entry zapcore.Entry) (err error) {
+			defer func() {
+				if recover() != nil {
+					err = errHookPanicked
+				}
+			}()
+			return h(entry)
+		})
+	}
+	return protected
+}
+
+func installProcessGlobals(l *zap.Logger, redirectStdLog bool) func() {
+	undoGlobals := zap.ReplaceGlobals(l)
+	undoStd := func() {}
+	if redirectStdLog {
+		undoStd = zap.RedirectStdLog(l.Named("stdlog"))
+	}
+	return func() {
+		undoStd()
+		undoGlobals()
+	}
 }
 
 // ReplaceForTest installs inst as the global logger and returns a function that

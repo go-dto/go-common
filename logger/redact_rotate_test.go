@@ -34,8 +34,14 @@ func TestRedactFormURLHeadersBody(t *testing.T) {
 	if strings.Contains(u, "pass") || strings.Contains(u, "abc") || strings.Contains(u, "frag") || !strings.Contains(u, "example.com/hook") {
 		t.Errorf("url: %s", u)
 	}
-	h := r.Headers(map[string][]string{"Authorization": {"Bearer x"}, "Content-Type": {"application/json"}})
-	if h["Authorization"] != redactedMarker || h["Content-Type"] != "application/json" {
+	h := r.Headers(map[string][]string{
+		"Authorization":       {"Bearer x"},
+		"X-API-Key":           {"secret-key"},
+		"Proxy-Authorization": {"Basic x"},
+		"Content-Type":        {"application/json"},
+	})
+	if h["Authorization"] != redactedMarker || h["X-API-Key"] != redactedMarker ||
+		h["Proxy-Authorization"] != redactedMarker || h["Content-Type"] != "application/json" {
 		t.Errorf("headers: %v", h)
 	}
 	if got := r.Body("application/octet-stream", []byte("bin"), 0); !strings.HasPrefix(got, "[BODY OMITTED") {
@@ -46,6 +52,13 @@ func TestRedactFormURLHeadersBody(t *testing.T) {
 	}
 	if got := truncate("héllo", 2); got != "h...[TRUNCATED]" {
 		t.Errorf("utf8 truncate: %q", got)
+	}
+	if got := r.JSON([]byte(`{"ok":true} {"password":"leak"}`)); got != "[UNPARSEABLE JSON OMITTED]" {
+		t.Errorf("trailing JSON must be rejected: %s", got)
+	}
+	large := []byte(strings.Repeat("x", DefaultMaxRedactionInputBytes+1))
+	if got := r.JSON(large); got != tooLargeJSONMarker {
+		t.Errorf("large JSON = %q", got)
 	}
 }
 
@@ -130,5 +143,34 @@ func TestRotatingFileDailyAndMaxAge(t *testing.T) {
 	// so 10-02 is deleted and 10-03, 10-04, 10-05 survive.
 	if len(backups) != 3 {
 		t.Fatalf("want 3 backups within max age, got %d: %v", len(backups), backups)
+	}
+}
+
+func TestRotatingFileBackupNameCollision(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	rf, err := NewRotatingFile(FileConfig{Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 9, 12, 0, 0, 123000000, time.Local)
+	rf.now = func() time.Time { return now }
+	for i := 0; i < 2; i++ {
+		if _, err := rf.Write([]byte("line\n")); err != nil {
+			t.Fatal(err)
+		}
+		if err := rf.Rotate(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := rf.Close(); err != nil {
+		t.Fatal(err)
+	}
+	backups, _ := filepath.Glob(filepath.Join(dir, "app-*.log"))
+	if len(backups) != 2 {
+		t.Fatalf("want two unique backups, got %v", backups)
+	}
+	if err := rf.Rotate(); err == nil {
+		t.Fatal("rotate after close should fail")
 	}
 }

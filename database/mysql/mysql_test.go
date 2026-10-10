@@ -2,6 +2,7 @@ package mysql
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"net"
 	"os"
@@ -82,6 +83,21 @@ func TestDriverConfigErrors(t *testing.T) {
 	dc, _ := driverConfig(Config{Host: "h", Configure: func(c *driver.Config) error { c.InterpolateParams = true; return nil }})
 	if !dc.InterpolateParams {
 		t.Error("Configure change not applied")
+	}
+}
+
+func TestValidateProduction(t *testing.T) {
+	if err := (Config{Host: "db.internal"}).ValidateProduction(); err == nil {
+		t.Fatal("plaintext production config should fail")
+	}
+	if err := (Config{Host: "db.internal", TLS: &tls.Config{InsecureSkipVerify: true}}).ValidateProduction(); err == nil { //nolint:gosec -- validation test
+		t.Fatal("unverified production TLS should fail")
+	}
+	if err := (Config{Host: "db.internal", TLS: &tls.Config{ServerName: "db.internal", MinVersion: tls.VersionTLS12}}).ValidateProduction(); err != nil {
+		t.Fatalf("verified production TLS: %v", err)
+	}
+	if err := (Config{DSN: "u:p@unix(/cloudsql/project:region:instance)/db"}).ValidateProduction(); err != nil {
+		t.Fatalf("trusted unix proxy: %v", err)
 	}
 }
 

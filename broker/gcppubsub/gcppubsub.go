@@ -15,6 +15,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 	"sync"
 
 	"cloud.google.com/go/pubsub/v2"
@@ -51,6 +53,30 @@ type Config struct {
 	EnableMessageOrdering bool
 }
 
+// ValidateProduction validates the subset of Pub/Sub configuration whose
+// transport security can be guaranteed by this package. Production uses
+// Application Default Credentials and the standard Google endpoint; injected
+// clients and arbitrary client options must be reviewed by the application.
+func (cfg Config) ValidateProduction() error {
+	projectID := strings.TrimSpace(cfg.ProjectID)
+	if projectID == "" {
+		return errors.New("gcppubsub: ProjectID is required in production")
+	}
+	if strings.ContainsAny(projectID, "\r\n\t") {
+		return errors.New("gcppubsub: ProjectID contains control characters")
+	}
+	if cfg.Client != nil {
+		return errors.New("gcppubsub: production validation cannot verify an injected Client")
+	}
+	if len(cfg.ClientOptions) != 0 {
+		return errors.New("gcppubsub: production validation cannot verify ClientOptions")
+	}
+	if emulator := strings.TrimSpace(os.Getenv("PUBSUB_EMULATOR_HOST")); emulator != "" {
+		return errors.New("gcppubsub: PUBSUB_EMULATOR_HOST must be unset in production")
+	}
+	return nil
+}
+
 // Driver implements broker.Driver. It is safe for concurrent use.
 type Driver struct {
 	client     *pubsub.Client
@@ -64,6 +90,10 @@ type Driver struct {
 	mu     sync.Mutex
 	closed bool
 	pubs   map[string]*pubsub.Publisher
+
+	closeOnce sync.Once
+	closeDone chan struct{}
+	closeErr  error
 }
 
 var _ broker.Driver = (*Driver)(nil)
@@ -90,6 +120,7 @@ func NewDriver(ctx context.Context, cfg Config) (*Driver, error) {
 		ctx:        dctx,
 		cancel:     cancel,
 		pubs:       make(map[string]*pubsub.Publisher),
+		closeDone:  make(chan struct{}),
 	}, nil
 }
 
@@ -185,25 +216,40 @@ func (d *Driver) Receive(ctx context.Context, subscription string, h broker.Hand
 // Close stops active Receive calls (waiting for in-flight handlers), flushes
 // pending publishes, and closes the client if the driver created it.
 func (d *Driver) Close() error {
-	d.mu.Lock()
-	if d.closed {
-		d.mu.Unlock()
-		return nil
-	}
-	d.closed = true
-	pubs := d.pubs
-	d.pubs = nil
-	d.mu.Unlock()
+	return d.CloseContext(context.Background())
+}
 
-	d.cancel()
-	d.wg.Wait()
-	for _, p := range pubs {
-		p.Stop()
+// CloseContext is Close with a bounded wait. Cleanup continues in the
+// background when ctx expires, and later calls wait for the same cleanup.
+func (d *Driver) CloseContext(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("gcppubsub: nil close context")
 	}
-	if d.ownsClient {
-		return d.client.Close()
+	d.closeOnce.Do(func() {
+		d.mu.Lock()
+		d.closed = true
+		pubs := d.pubs
+		d.pubs = nil
+		d.mu.Unlock()
+		d.cancel()
+
+		go func() {
+			d.wg.Wait()
+			for _, p := range pubs {
+				p.Stop()
+			}
+			if d.ownsClient {
+				d.closeErr = d.client.Close()
+			}
+			close(d.closeDone)
+		}()
+	})
+	select {
+	case <-d.closeDone:
+		return d.closeErr
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	return nil
 }
 
 func fromPubsub(m *pubsub.Message) *broker.Message {

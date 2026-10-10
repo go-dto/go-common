@@ -3,6 +3,7 @@ package logger
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/url"
 	"strings"
 	"unicode/utf8"
@@ -14,21 +15,42 @@ import (
 // so "api_key", "apiKey" and "API-KEY" are all caught.
 var DefaultSensitiveKeys = []string{
 	"password", "passwd", "pwd", "secret", "client_secret",
+	"new_password", "old_password", "password_confirmation",
 	"token", "access_token", "refresh_token", "id_token", "authorization", "auth",
 	"api_key", "apikey", "private_key", "privatekey", "sender_private_key",
+	"x_api_key", "x_auth_token", "proxy_authorization", "x_amz_security_token", "x_goog_api_key",
 	"cookie", "set_cookie", "session",
 	"pin", "otp", "cvv", "cvc", "card_number", "pan",
 }
 
+const (
+	// DefaultMaxRedactionInputBytes bounds the extra allocations made while
+	// decoding and re-encoding payloads on a logging path.
+	DefaultMaxRedactionInputBytes = 1 << 20 // 1 MiB
+	tooLargeJSONMarker            = "[JSON OMITTED: TOO LARGE]"
+	tooLargeFormMarker            = "[FORM OMITTED: TOO LARGE]"
+)
+
 // Redactor masks sensitive values in request/response bodies, URLs and headers.
 // It is immutable and safe for concurrent use.
 type Redactor struct {
-	keys map[string]struct{}
+	keys          map[string]struct{}
+	maxInputBytes int
 }
 
 // NewRedactor builds a redactor for DefaultSensitiveKeys plus extra keys.
 func NewRedactor(extra ...string) *Redactor {
-	r := &Redactor{keys: make(map[string]struct{}, len(DefaultSensitiveKeys)+len(extra))}
+	return NewRedactorWithLimit(DefaultMaxRedactionInputBytes, extra...)
+}
+
+// NewRedactorWithLimit is NewRedactor with a custom maximum input size.
+// maxInputBytes <= 0 disables the limit and should only be used for trusted,
+// already-bounded data.
+func NewRedactorWithLimit(maxInputBytes int, extra ...string) *Redactor {
+	r := &Redactor{
+		keys:          make(map[string]struct{}, len(DefaultSensitiveKeys)+len(extra)),
+		maxInputBytes: maxInputBytes,
+	}
 	for _, k := range append(append([]string{}, DefaultSensitiveKeys...), extra...) {
 		if k = normalizeKey(k); k != "" {
 			r.keys[k] = struct{}{}
@@ -52,10 +74,17 @@ func (r *Redactor) IsSensitive(key string) bool {
 // including inside arrays) replaced by "[REDACTED]". If data is not valid JSON
 // it returns a placeholder instead of the raw bytes, so nothing leaks by accident.
 func (r *Redactor) JSON(data []byte) string {
+	if r.inputTooLarge(len(data)) {
+		return tooLargeJSONMarker
+	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber() // keep large numbers intact
 	var v any
 	if err := dec.Decode(&v); err != nil {
+		return "[UNPARSEABLE JSON OMITTED]"
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
 		return "[UNPARSEABLE JSON OMITTED]"
 	}
 	out, err := json.Marshal(r.walk(v))
@@ -88,6 +117,9 @@ func (r *Redactor) walk(v any) any {
 
 // Form redacts an application/x-www-form-urlencoded body or URL query string.
 func (r *Redactor) Form(raw string) string {
+	if r.inputTooLarge(len(raw)) {
+		return tooLargeFormMarker
+	}
 	vals, err := url.ParseQuery(raw)
 	if err != nil {
 		return "[UNPARSEABLE FORM OMITTED]"
@@ -119,6 +151,10 @@ func (r *Redactor) Body(contentType string, body []byte, maxBytes int) string {
 		return "[BODY OMITTED: " + strings.TrimSpace(strings.SplitN(ct, ";", 2)[0]) + "]"
 	}
 	return truncate(s, maxBytes)
+}
+
+func (r *Redactor) inputTooLarge(n int) bool {
+	return r != nil && r.maxInputBytes > 0 && n > r.maxInputBytes
 }
 
 // URL strips credentials (user:pass@) and masks every query value, keeping the

@@ -2,8 +2,10 @@ package httpclient
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -328,6 +330,7 @@ func TestFacadeInvalidConfigurationAndOptions(t *testing.T) {
 			}
 		})
 	}
+	//lint:ignore SA1012 deliberately testing the public nil-context boundary
 	if _, err := client.Get(nil, "/users"); KindOf(err) != KindInvalidRequest {
 		t.Fatalf("nil context err=%v", err)
 	}
@@ -423,6 +426,121 @@ func TestFacadeDynamicTokenError(t *testing.T) {
 	}
 }
 
+func TestDynamicTokenRejectsNewline(t *testing.T) {
+	client := MustNew(Config{
+		Peer: "auth-api", BaseURL: "https://example.com", DisableLogging: true,
+		Auth: BearerTokenProvider(func(context.Context) (string, error) {
+			return "secret\r\ninjected", nil
+		}),
+	})
+	if _, err := client.Get(context.Background(), "/users"); KindOf(err) != KindAuth {
+		t.Fatalf("err=%v kind=%s", err, KindOf(err))
+	}
+}
+
+func TestHooksCannotCrashRequestAndRetryBodyClosesFirst(t *testing.T) {
+	logs := observeFacade(t)
+	var calls atomic.Int32
+	var closed atomic.Bool
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if calls.Add(1) == 1 {
+			return &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Header:     make(http.Header),
+				Body:       &trackingBody{closed: &closed},
+				Request:    req,
+			}, nil
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: http.NoBody, Request: req}, nil
+	})
+	client := MustNew(Config{
+		Peer: "hook-api", BaseURL: "https://example.com", Transport: transport,
+		OnRetry: func(RetryEvent) {
+			if !closed.Load() {
+				t.Error("retry hook ran before response body was closed")
+			}
+			panic("sensitive retry hook panic")
+		},
+		OnResult: func(context.Context, ResultEvent) { panic("sensitive result hook panic") },
+	})
+	response, err := client.Get(context.Background(), "/resource")
+	if err != nil || response.StatusCode != http.StatusOK || calls.Load() != 2 {
+		t.Fatalf("response=%+v err=%v calls=%d", response, err, calls.Load())
+	}
+	if logs.FilterMessage("httpclient hook panicked").Len() != 2 {
+		t.Fatalf("hook panic logs=%v", logs.All())
+	}
+	if strings.Contains(fmt.Sprint(logs.All()), "sensitive") {
+		t.Fatalf("hook panic value leaked: %v", logs.All())
+	}
+}
+
+func TestValidateProduction(t *testing.T) {
+	if err := (Config{Peer: "peer", BaseURL: "http://example.com"}).ValidateProduction(); KindOf(err) != KindInvalidConfig {
+		t.Fatalf("HTTP production config err=%v", err)
+	}
+	if err := (Config{
+		Peer: "peer", BaseURL: "https://example.com",
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec -- validation test
+	}).ValidateProduction(); KindOf(err) != KindInvalidConfig {
+		t.Fatalf("insecure TLS production config err=%v", err)
+	}
+	if err := (Config{Peer: "peer", BaseURL: "https://example.com"}).ValidateProduction(); err != nil {
+		t.Fatalf("valid production config: %v", err)
+	}
+	if err := (Config{
+		Peer: "peer", BaseURL: "https://example.com",
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, errors.New("unused") }),
+	}).ValidateProduction(); KindOf(err) != KindInvalidConfig {
+		t.Fatalf("custom transport must not pass unverifiable production validation: %v", err)
+	}
+	for _, cfg := range []Config{
+		{Peer: "peer", BaseURL: "https://example.com", Timeout: -1},
+		{Peer: "peer", BaseURL: "https://example.com", ResponseHeaderTimeout: -1},
+	} {
+		if err := cfg.ValidateProduction(); KindOf(err) != KindInvalidConfig {
+			t.Fatalf("unbounded production config must fail: %+v err=%v", cfg, err)
+		}
+	}
+}
+
+func TestAuthProviderUsesLogicalRequestDeadline(t *testing.T) {
+	client := MustNew(Config{
+		Peer: "auth-api", BaseURL: "https://example.com", Timeout: 25 * time.Millisecond,
+		Auth: BearerTokenProvider(func(ctx context.Context) (string, error) {
+			<-ctx.Done()
+			return "", ctx.Err()
+		}),
+		DisableLogging: true,
+	})
+	started := time.Now()
+	_, err := client.Get(context.Background(), "/resource")
+	if !IsTimeout(err) || time.Since(started) > time.Second {
+		t.Fatalf("auth provider was not bounded by logical timeout: err=%v duration=%v", err, time.Since(started))
+	}
+}
+
+func TestMalformedCustomTransportReturnsErrorInsteadOfPanicking(t *testing.T) {
+	client := MustNew(Config{
+		Peer: "broken-api", BaseURL: "https://example.com", DisableLogging: true,
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, nil }),
+	})
+	if _, err := client.Get(context.Background(), "/resource"); KindOf(err) != KindTransport {
+		t.Fatalf("malformed transport err=%v", err)
+	}
+
+	client = MustNew(Config{
+		Peer: "empty-api", BaseURL: "https://example.com", DisableLogging: true,
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusNoContent, Header: make(http.Header), Request: req}, nil
+		}),
+	})
+	response, err := client.Get(context.Background(), "/resource")
+	if err != nil || response.StatusCode != http.StatusNoContent || len(response.Bytes()) != 0 {
+		t.Fatalf("nil response body should be normalized: response=%+v err=%v", response, err)
+	}
+}
+
 func TestFacadeRedirectPolicy(t *testing.T) {
 	var targetCalls atomic.Int32
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -472,4 +590,15 @@ func mustJSON(t *testing.T, value any) []byte {
 		t.Fatal(err)
 	}
 	return data
+}
+
+type trackingBody struct {
+	closed *atomic.Bool
+}
+
+func (*trackingBody) Read([]byte) (int, error) { return 0, io.EOF }
+
+func (b *trackingBody) Close() error {
+	b.closed.Store(true)
+	return nil
 }

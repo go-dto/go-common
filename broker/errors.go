@@ -3,7 +3,6 @@ package broker
 import (
 	"context"
 	"errors"
-	"fmt"
 	"runtime/debug"
 )
 
@@ -37,15 +36,20 @@ func (e *permanentError) Unwrap() error { return e.err }
 // broker's dead letter policy removes it.
 type PanicError struct {
 	Value any
+	// Stack is populated only when Options.LogPanicStack is enabled.
 	Stack []byte
 }
 
-func (e *PanicError) Error() string { return fmt.Sprintf("handler panic: %v", e.Value) }
+func (e *PanicError) Error() string { return "handler panic" }
 
-func safeCall(ctx context.Context, h Handler, msg *Message) (err error) {
+func safeCall(ctx context.Context, h Handler, msg *Message, captureStack bool) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			err = &PanicError{Value: r, Stack: debug.Stack()}
+			panicErr := &PanicError{Value: r}
+			if captureStack {
+				panicErr.Stack = debug.Stack()
+			}
+			err = panicErr
 		}
 	}()
 	return h(ctx, msg)

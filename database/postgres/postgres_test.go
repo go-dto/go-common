@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"strconv"
@@ -97,6 +98,18 @@ func TestPoolConfigErrors(t *testing.T) {
 	}
 }
 
+func TestValidateProduction(t *testing.T) {
+	if err := (Config{Host: "db.internal", SSLMode: "disable"}).ValidateProduction(); err == nil {
+		t.Fatal("plaintext production config should fail")
+	}
+	if err := (Config{Host: "db.internal", SSLMode: "require"}).ValidateProduction(); err == nil {
+		t.Fatal("unverified production TLS should fail")
+	}
+	if err := (Config{Host: "db.internal", SSLMode: "verify-full"}).ValidateProduction(); err != nil {
+		t.Fatalf("verified production TLS: %v", err)
+	}
+}
+
 func TestOpenUnreachable(t *testing.T) {
 	t.Cleanup(logger.ReplaceForTest(zap.NewNop()))
 	l, err := net.Listen("tcp", "127.0.0.1:0")
@@ -122,7 +135,7 @@ func TestOpenUnreachable(t *testing.T) {
 func TestQueryTracer(t *testing.T) {
 	core, logs := observer.New(zapcore.DebugLevel)
 	t.Cleanup(logger.ReplaceForTest(zap.New(core)))
-	tr := NewQueryTracer(QueryLogOptions{SlowThreshold: 50 * time.Millisecond})
+	tr := NewQueryTracer(QueryLogOptions{SlowThreshold: 50 * time.Millisecond, IncludeStatement: true})
 	ctx := ctxid.WithContext(context.Background(), "trace-1")
 
 	run := func(sql string, d time.Duration, tag string, err error) {
@@ -169,6 +182,34 @@ func TestQueryTracer(t *testing.T) {
 	if first[database.KeyStatement] != "INSERT INTO deliveries (id) VALUES ($1)" ||
 		first[database.KeyOperation] != "INSERT" || first[database.KeyRows] != int64(1) {
 		t.Errorf("insert fields = %v", first)
+	}
+}
+
+func TestQueryTracerOmitsStatementAndErrorDetailsByDefault(t *testing.T) {
+	core, logs := observer.New(zapcore.DebugLevel)
+	t.Cleanup(logger.ReplaceForTest(zap.New(core)))
+	tr := NewQueryTracer(QueryLogOptions{})
+	secret := "PATIENT-NIK-3170000000000001"
+	qctx := tr.TraceQueryStart(context.Background(), nil, pgx.TraceQueryStartData{
+		SQL: "SELECT * FROM patient WHERE nik = '" + secret + "'",
+	})
+	tr.TraceQueryEnd(qctx, nil, pgx.TraceQueryEndData{
+		Err: &pgconn.PgError{Code: "22000", Message: "invalid value " + secret, Detail: secret},
+	})
+
+	entries := logs.FilterMessage("postgres query failed").All()
+	if len(entries) != 1 {
+		t.Fatalf("entries=%v", logs.All())
+	}
+	fields := entries[0].ContextMap()
+	if _, exists := fields[database.KeyStatement]; exists {
+		t.Fatalf("statement logged by default: %v", fields)
+	}
+	if fields[database.KeyOperation] != "SELECT" || fields["db_error_code"] != "22000" {
+		t.Fatalf("safe fields=%v", fields)
+	}
+	if strings.Contains(entries[0].Message+fmt.Sprint(fields), secret) {
+		t.Fatalf("sensitive SQL/error detail leaked: %v", fields)
 	}
 }
 

@@ -2,6 +2,8 @@ package mongolog
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,7 +32,7 @@ func TestMonitor(t *testing.T) {
 
 	m.Started(ctx, &event.CommandStartedEvent{Command: cmd, CommandName: "insert", DatabaseName: "db", RequestID: 2, ConnectionID: "c1"})
 	m.Failed(ctx, &event.CommandFailedEvent{CommandFinishedEvent: event.CommandFinishedEvent{
-		CommandName: "insert", DatabaseName: "db", RequestID: 2, ConnectionID: "c1"}, Failure: "duplicate key"})
+		CommandName: "insert", DatabaseName: "db", RequestID: 2, ConnectionID: "c1"}, Failure: "duplicate key patient_id=secret-patient"})
 
 	m.Started(ctx, &event.CommandStartedEvent{CommandName: "hello", RequestID: 3, ConnectionID: "c1"})
 	m.Succeeded(ctx, &event.CommandSucceededEvent{CommandFinishedEvent: event.CommandFinishedEvent{CommandName: "hello", RequestID: 3, ConnectionID: "c1"}})
@@ -53,6 +55,10 @@ func TestMonitor(t *testing.T) {
 	}
 	if logs.FilterMessage("mongo command failed").FilterLevelExact(zapcore.WarnLevel).Len() != 1 {
 		t.Fatal("want warn for failed command")
+	}
+	failed := logs.FilterMessage("mongo command failed").All()[0].ContextMap()
+	if failed["error_kind"] != "mongo_command" || strings.Contains(fmt.Sprint(failed), "secret-patient") {
+		t.Fatalf("failure must be classified without raw driver text: %v", failed)
 	}
 	if logs.FilterField(zap.String("db_command", "hello")).Len() != 0 {
 		t.Fatal("hello must be ignored")

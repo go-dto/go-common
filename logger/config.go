@@ -249,6 +249,24 @@ func (c Config) Validate() error {
 	if len(c.Outputs) == 0 {
 		return fmt.Errorf("logger: at least one output is required")
 	}
+	if c.EnableFunction && !c.EnableCaller {
+		return fmt.Errorf("logger: EnableFunction requires EnableCaller")
+	}
+	if c.SlowOpThreshold < 0 {
+		return fmt.Errorf("logger: SlowOpThreshold must be >= 0")
+	}
+	if c.File.MaxSizeMB < 0 {
+		return fmt.Errorf("logger: File.MaxSizeMB must be >= 0")
+	}
+	if c.File.MaxBackups < 0 {
+		return fmt.Errorf("logger: File.MaxBackups must be >= 0")
+	}
+	if c.File.MaxAge < 0 {
+		return fmt.Errorf("logger: File.MaxAge must be >= 0")
+	}
+	if c.Sampling != nil && (c.Sampling.Initial <= 0 || c.Sampling.Thereafter <= 0) {
+		return fmt.Errorf("logger: Sampling.Initial and Sampling.Thereafter must be > 0")
+	}
 	for _, o := range c.Outputs {
 		switch o {
 		case OutputStdout, OutputStderr:
@@ -258,6 +276,30 @@ func (c Config) Validate() error {
 			}
 		default:
 			return fmt.Errorf("logger: unknown output %q (want stdout|stderr|file)", o)
+		}
+	}
+	return nil
+}
+
+// ValidateProduction applies stricter invariants needed by centralized log
+// ingestion. It is intentionally separate from Validate so local tools and
+// tests can still build a logger without service metadata.
+func (c Config) ValidateProduction() error {
+	if err := c.Validate(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(c.ServiceName) == "" {
+		return fmt.Errorf("logger: ServiceName is required in production")
+	}
+	if strings.TrimSpace(c.Environment) == "" {
+		return fmt.Errorf("logger: Environment is required in production")
+	}
+	if c.Format != "" && c.Format != FormatJSON {
+		return fmt.Errorf("logger: production format must be json")
+	}
+	for _, output := range c.Outputs {
+		if output == OutputFile && c.File.MaxBackups == 0 && c.File.MaxAge == 0 {
+			return fmt.Errorf("logger: production file output requires bounded retention")
 		}
 	}
 	return nil

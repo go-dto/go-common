@@ -20,6 +20,7 @@ const (
 	DefaultTLSHandshakeTimeout   = 5 * time.Second
 	DefaultResponseHeaderTimeout = 10 * time.Second
 	DefaultMaxIdleConnsPerHost   = 10
+	DefaultMaxConnsPerHost       = 100
 	DefaultMaxResponseBodyBytes  = int64(4 << 20) // 4 MiB
 )
 
@@ -33,7 +34,9 @@ var defaultRetryStatuses = []int{
 // Config configures a Client. Peer and BaseURL are required. The zero values of
 // timeout, retry and connection-pool fields use production-safe defaults.
 type Config struct {
-	Peer    string
+	Peer string
+	// BaseURL accepts HTTP for tests/local development. Call
+	// ValidateProduction at startup to require verified HTTPS.
 	BaseURL string
 
 	DefaultHeaders HeaderMap
@@ -73,7 +76,9 @@ type Config struct {
 	TLSHandshakeTimeout   time.Duration
 	ResponseHeaderTimeout time.Duration
 	MaxIdleConnsPerHost   int
-	MaxConnsPerHost       int
+	// MaxConnsPerHost bounds active and idle connections per upstream. Zero uses
+	// DefaultMaxConnsPerHost; a positive bound is required in production.
+	MaxConnsPerHost int
 	// FollowRedirects permits redirects only to the same scheme and host.
 	// Redirects are returned as normal 3xx responses by default.
 	FollowRedirects bool
@@ -119,7 +124,7 @@ func (c Config) normalized() (Config, *url.URL, error) {
 	if c.MaxResponseBodyBytes < 0 {
 		return Config{}, nil, configError("MaxResponseBodyBytes must not be negative")
 	}
-	if c.MaxResponseBodyBytes >= math.MaxInt64 {
+	if c.MaxResponseBodyBytes == math.MaxInt64 {
 		return Config{}, nil, configError("MaxResponseBodyBytes is too large")
 	}
 	if c.PerAttemptTimeout < 0 {
@@ -151,6 +156,36 @@ func (c Config) normalized() (Config, *url.URL, error) {
 
 	c = c.withDefaults()
 	return c, cloneURL(baseURL), nil
+}
+
+// ValidateProduction applies New's validation plus transport requirements
+// suitable for traffic that leaves a trusted local development environment.
+// It requires HTTPS, verified TLS, bounded timeouts/connections, and the
+// package-managed transport so those invariants can be inspected.
+func (c Config) ValidateProduction() error {
+	normalized, baseURL, err := c.normalized()
+	if err != nil {
+		return err
+	}
+	if baseURL.Scheme != "https" {
+		return configError("production BaseURL must use https")
+	}
+	if normalized.TLSClientConfig != nil && normalized.TLSClientConfig.InsecureSkipVerify {
+		return configError("production TLS must verify server certificates")
+	}
+	if normalized.Transport != nil {
+		return configError("production validation cannot verify a custom Transport")
+	}
+	if normalized.Timeout <= 0 {
+		return configError("production Timeout must be positive")
+	}
+	if normalized.ResponseHeaderTimeout <= 0 {
+		return configError("production ResponseHeaderTimeout must be positive")
+	}
+	if normalized.MaxConnsPerHost <= 0 {
+		return configError("production MaxConnsPerHost must be positive")
+	}
+	return nil
 }
 
 func (c Config) withDefaults() Config {
@@ -188,6 +223,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.MaxIdleConnsPerHost <= 0 {
 		c.MaxIdleConnsPerHost = DefaultMaxIdleConnsPerHost
+	}
+	if c.MaxConnsPerHost == 0 {
+		c.MaxConnsPerHost = DefaultMaxConnsPerHost
 	}
 	if c.MaxResponseBodyBytes == 0 {
 		c.MaxResponseBodyBytes = DefaultMaxResponseBodyBytes

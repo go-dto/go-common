@@ -97,8 +97,26 @@ func Connect(ctx context.Context, cfg Config) (*mongo.Client, error) {
 	return client, nil
 }
 
+// ValidateProduction validates the effective client settings without opening
+// a socket. It requires TLS with server certificate verification.
+func (cfg Config) ValidateProduction() error {
+	opts, err := clientOptions(cfg)
+	if err != nil {
+		return err
+	}
+	if opts.TLSConfig == nil || opts.TLSConfig.InsecureSkipVerify {
+		return errors.New("mongodb: production connections require verified TLS")
+	}
+	return nil
+}
+
 // Check returns a health check that pings the primary.
 func Check(name string, client *mongo.Client) database.Check {
+	if client == nil {
+		return database.Check{Name: name, Ping: func(context.Context) error {
+			return errors.New("mongodb: nil client")
+		}}
+	}
 	return database.Check{Name: name, Ping: ping(client)}
 }
 
@@ -111,11 +129,6 @@ func clientOptions(cfg Config) (*options.ClientOptions, error) {
 		return nil, errors.New("mongodb: URI is required")
 	}
 	opts := options.Client().ApplyURI(cfg.URI)
-	if err := opts.Validate(); err != nil {
-		// Driver errors may quote the URI; keep credentials out of logs.
-		return nil, errors.New("mongodb: invalid URI or options")
-	}
-
 	if cfg.AppName != "" {
 		opts.SetAppName(cfg.AppName)
 	}
@@ -140,6 +153,13 @@ func clientOptions(cfg Config) (*options.ClientOptions, error) {
 		if err := cfg.Configure(opts); err != nil {
 			return nil, fmt.Errorf("mongodb: configure: %w", err)
 		}
+	}
+	// Validate only after every package override and caller customization has
+	// been applied. ClientOptions caches validation results, so validating the
+	// URI first would miss invalid final combinations such as minPool > maxPool.
+	if err := opts.Validate(); err != nil {
+		// Driver errors may quote the URI; keep credentials out of logs.
+		return nil, errors.New("mongodb: invalid URI or options")
 	}
 	return opts, nil
 }

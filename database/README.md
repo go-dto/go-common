@@ -1,6 +1,6 @@
 # database
 
-Inisialisasi koneksi database dengan default production: timeout, connection pool yang dibatasi dan didaur ulang, ping dengan retry saat startup, health check untuk readiness probe, serta logging lewat [`logger`](../logger/README.md) **tanpa pernah mencatat kredensial atau argumen query**.
+Inisialisasi koneksi database dengan default production: timeout, connection pool yang dibatasi dan didaur ulang, ping dengan retry saat startup, health check untuk readiness probe, serta logging lewat [`logger`](../logger/README.md) **tanpa mencatat kredensial, argumen query, atau SQL statement secara default**.
 
 | Package | Hasil | Driver |
 |---|---|---|
@@ -26,15 +26,25 @@ defer db.Close()
 // PostgreSQL
 pool, err := postgres.Open(ctx, postgres.Config{
 	Host: cfg.PGHost, User: cfg.PGUser, Password: cfg.PGPassword, Database: "fhir",
-	SSLMode:          "require",
+	SSLMode:          "verify-full",
 	ApplicationName:  "webhook-service",
 	StatementTimeout: 30 * time.Second,
 })
+if err != nil {
+	return err
+}
 defer pool.Close()
 
 // MongoDB
 client, err := mongodb.Connect(ctx, mongodb.Config{URI: cfg.MongoURI, AppName: "webhook-service"})
-defer client.Disconnect(context.Background())
+if err != nil {
+	return err
+}
+defer func() {
+    closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+    defer cancel()
+    _ = client.Disconnect(closeCtx)
+}()
 
 // Readiness probe
 mux.Handle("/readyz", database.HealthHandler(0,
@@ -80,15 +90,19 @@ Setiap ping gagal dicatat warn (`database not ready, retrying`), berhasil info (
 
 Detail error hanya dicatat di log (warn), tidak dikirim di response, supaya hostname/pesan driver tidak bocor. Pasang di **readiness** probe saja: liveness yang ikut gagal saat DB down akan membuat Kubernetes me-restart pod yang sebenarnya sehat.
 
+Handler mengisolasi panic, `Ping=nil`, nama kosong/duplikat, dan check yang mengabaikan context. Request readiness tetap kembali saat deadline; goroutine check yang mengabaikan context dapat tetap hidup, jadi setiap implementasi `Ping` tetap wajib menghormati cancellation.
+
 ## Logging query
 
 | | Per query | Keterangan |
 |---|---|---|
-| PostgreSQL | `postgres query` (debug), `… slow` (warn, ≥500ms), `… failed` (warn) | `db_statement` (whitespace dirapikan, maks 1000 byte), `db_operation`, `db_rows_affected`, `duration_ms`. **Argumen tidak pernah dicatat.** Atur lewat `Config.QueryLog`. |
-| MongoDB | `mongo command` (debug), slow/failed (warn) | Lewat `logger/mongolog`; body command tidak dicatat. Atur lewat `Config.CommandLog`. |
-| MySQL | – | `database/sql` tidak punya hook query; gunakan `logger.StartOp` di repository (`db_system=mysql`) yang sudah mencatat durasi, slow, dan error. Pesan internal driver (koneksi putus, dll.) dialihkan ke logger terstruktur. |
+| PostgreSQL | `postgres query` (debug), `… slow` (warn, ≥500ms), `… failed` (warn) | Default hanya `db_operation`, `db_rows_affected`, `duration_ms`, dan kode error PostgreSQL. Argumen, detail error, dan SQL statement tidak dicatat. Atur lewat `Config.QueryLog`. |
+| MongoDB | `mongo command` (debug), slow/failed (warn) | Lewat `logger/mongolog`; body command dan raw failure tidak dicatat. Atur lewat `Config.CommandLog`. |
+| MySQL | – | `database/sql` tidak punya hook query; gunakan `logger.StartOp` di repository (`db_system=mysql`) yang sudah mencatat durasi, slow, dan error. Pesan internal driver diklasifikasikan tanpa menyalin teks mentahnya. |
 
 Kegagalan query dicatat **warn** karena error yang sama akan dicatat **error** satu kali oleh Op repository.
+
+`QueryLog.IncludeStatement` adalah opt-in dan hanya cocok untuk query yang dipastikan tidak memiliki literal sensitif. Untuk workload medis, biarkan `false`; parameterisasi query saja tidak dapat melindungi statement yang dibangun dengan literal.
 
 Semua baris membawa `trace_id`, `op`, `span_id` dari context — selalu teruskan `ctx` ke query (`QueryContext`, `pool.Query(ctx, …)`).
 
@@ -96,7 +110,19 @@ Semua baris membawa `trace_id`, `op`, `span_id` dari context — selalu teruskan
 
 - Password tidak pernah masuk log maupun pesan error dari `Open`/`Connect` (DSN/URI yang tidak valid menghasilkan pesan statis; dites).
 - Password dengan karakter khusus (`@ : / ? #`) aman dipakai di field `Password` — di-escape otomatis.
-- PostgreSQL: gunakan `SSLMode: "require"` atau lebih ketat di production. MySQL: isi `TLS` atau gunakan Cloud SQL Proxy.
+- Panggil `ValidateProduction()` pada konfigurasi sebelum `Open`/`Connect`. Koneksi TCP production harus memakai TLS dengan verifikasi sertifikat. MySQL Unix socket diterima untuk trusted local proxy.
+- PostgreSQL: gunakan `SSLMode: "verify-full"`. `require` mengenkripsi tetapi tidak memverifikasi identitas server dan ditolak oleh `ValidateProduction`.
+- Jika memakai trusted local proxy yang memang menyediakan transport aman tanpa TLS end-to-end, dokumentasikan pengecualian dan jangan panggil validasi TLS yang lebih ketat ini.
+- Readiness hanya mencatat transisi sehat → gagal dan gagal → pulih; raw error
+  driver tidak dicatat agar probe berulang tidak menimbulkan log storm atau
+  membocorkan alamat dependency.
+
+```go
+if err := postgresConfig.ValidateProduction(); err != nil {
+	return err
+}
+pool, err := postgres.Open(ctx, postgresConfig)
+```
 
 ## Tes integrasi
 

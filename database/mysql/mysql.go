@@ -111,6 +111,35 @@ func Open(ctx context.Context, cfg Config) (*sql.DB, error) {
 	return db, nil
 }
 
+// ValidateProduction validates the connection settings without opening a
+// socket. TCP connections must use TLS with certificate verification and may
+// not fall back to plaintext. Unix sockets are accepted for trusted local
+// proxies. Custom named TLS registrations remain the caller's responsibility.
+func (cfg Config) ValidateProduction() error {
+	dc, err := driverConfig(cfg)
+	if err != nil {
+		return err
+	}
+	if dc.Net == "unix" {
+		return nil
+	}
+	if dc.AllowFallbackToPlaintext {
+		return errors.New("mysql: production TLS must not fall back to plaintext")
+	}
+	if dc.TLS != nil {
+		if dc.TLS.InsecureSkipVerify {
+			return errors.New("mysql: production TLS must verify server certificates")
+		}
+		return nil
+	}
+	switch dc.TLSConfig {
+	case "", "false", "preferred", "skip-verify":
+		return errors.New("mysql: production TCP connections require verified TLS")
+	default:
+		return nil
+	}
+}
+
 func driverConfig(cfg Config) (*driver.Config, error) {
 	var dc *driver.Config
 	if cfg.DSN != "" {
@@ -189,5 +218,6 @@ func configurePool(db *sql.DB, cfg Config) {
 type driverLogger struct{}
 
 func (driverLogger) Print(v ...any) {
-	logger.L().WithOptions(zap.WithCaller(false)).Warn(fmt.Sprint(v...), zap.String(logger.KeyDBSystem, database.SystemMySQL))
+	logger.L().WithOptions(zap.WithCaller(false)).Warn("mysql driver event",
+		zap.String(logger.KeyDBSystem, database.SystemMySQL), zap.String("error_kind", "driver"))
 }
